@@ -1,0 +1,149 @@
+# Public-methods benchmark: forecast bank balances, rates and net interest income under macro scenarios
+# with methods published by the IMF, the Federal Reserve and the New York Fed, and compare them out-of-sample.
+#
+# Paths are relative to this file.
+
+output_dir: outputs
+
+macro:
+  metadata: data/macro_metadata.csv          # mnemonic, description, geography, theme, transform (dlog/diff), expected_sign
+  scenarios:                                  # history + scenario path in each file; history must be identical
+    baseline: data/scenario_baseline.csv
+    upside: data/scenario_s1_upside.csv
+    downside: data/scenario_s3_downside.csv
+    severe: data/scenario_s4_severe.csv
+  date_column: date
+
+# Which macro series may enter a model: signed series (expected_sign = +1/-1 in the target's sign file)
+# in these geographies. The sign file of each target decides the sign.
+candidates:
+  geographies: [Canada, Ontario]
+  exclude_themes: [Other]
+  max_lag: 2                  # each driver enters at one lag, 0..max_lag, chosen when screening
+  n_screen: 10                # keep the 10 best-correlated, correctly signed drivers at each origin
+  max_per_theme: 2            # at most 2 drivers from the same theme
+  max_corr: 0.85              # skip a driver nearly identical to one already kept
+
+horizon: 12                   # quarters ahead (errors are averaged over 1..12)
+
+oos:                          # rolling-origin, out-of-sample test: every method re-estimated at each origin
+  start: 2012Q4               # first origin
+  step: 1                     # every quarter
+  # Forecasts in the test use the macro values that actually happened (a conditional forecast, the usual
+  # way to validate stress-test models).
+
+intervals:
+  levels: [0.80, 0.95]        # conformal bands from the out-of-sample errors at each horizon
+  min_calibration: 12         # errors needed before a band is computed in the honest coverage check
+
+methods:
+  bma:                        # IMF Global Solvency Stress Test: panel fixed effects, BMA, sign constraints
+    max_vars: 3               # models with 0..3 macro drivers (all subsets of the screened drivers)
+  combination:                # Guerrieri & Welch (2012): one regression per macro variable, lags 1..4, averaged
+    lags: 4
+    n_vars: 10                # the strongest 10 drivers by screening (signs not imposed, as in the paper)
+  class:                      # NY Fed CLASS: one small, fixed, economically motivated equation per target
+    enabled: true             # the drivers are set per target (class_drivers). In this example every balance
+                              # uses the same generic set (GDP, unemployment, house prices, short rate) and every
+                              # rate the same market rates, so the challenger is not tuned to the data.
+  benchmarks: [random_walk, drift, ar1]
+
+targets:
+  # --- one bank ----------------------------------------------------------------------------------------
+  - name: loans_single
+    label: Loans, one bank
+    file: data/bank_data.csv
+    column: loan_balance
+    events: data/bank_events.csv          # acquisitions are taken out of growth (organic change)
+    form: dlog
+    signs: data/macro_metadata.csv
+    units: $ millions
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+
+  - name: deposits_single
+    label: Deposits, one bank
+    file: data/bank_data.csv
+    column: deposit_balance
+    events: data/bank_events.csv
+    form: dlog
+    signs: data/macro_metadata_deposits.csv
+    units: $ millions
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+
+  # --- a panel of banks --------------------------------------------------------------------------------
+  - name: loans_panel
+    label: Loans, five banks
+    file: data/panel_bank_data.csv
+    column: loan_balance
+    bank_column: bank_name
+    events: data/panel_bank_events.csv
+    form: dlog
+    signs: data/macro_metadata.csv
+    units: $ millions
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+
+  - name: mortgage_balance
+    label: Mortgage balances, five banks
+    file: data/panel_system_data.csv
+    column: mortgage_balance
+    bank_column: bank_name
+    form: dlog
+    signs: data/macro_metadata.csv
+    units: $ millions
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+
+  - name: commercial_balance
+    label: Commercial loan balances, five banks
+    file: data/panel_system_data.csv
+    column: commercial_balance
+    bank_column: bank_name
+    form: dlog
+    signs: data/macro_metadata_commercial_loans.csv
+    units: $ millions
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+
+  - name: deposit_balance
+    label: Deposit balances, five banks
+    file: data/panel_system_data.csv
+    column: deposit_balance
+    bank_column: bank_name
+    form: dlog
+    signs: data/macro_metadata_deposits.csv
+    units: $ millions
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+
+  - name: mortgage_rate
+    label: Mortgage rate, five banks
+    file: data/panel_system_data.csv
+    column: mortgage_rate
+    bank_column: bank_name
+    form: diff
+    signs: data/macro_metadata_deposit_rate.csv     # rates move with market rates (+)
+    units: percentage points
+    class_drivers: [FRTB3M.IC@0, FRGOV5Y.IC@0]
+
+  - name: deposit_rate
+    label: Deposit rate, five banks
+    file: data/panel_system_data.csv
+    column: deposit_rate
+    bank_column: bank_name
+    form: diff
+    signs: data/macro_metadata_deposit_rate.csv
+    units: percentage points
+    class_drivers: [FRTB3M.IC@0, FRGOV5Y.IC@0]
+
+  # --- Fed approach: income = rate x balance -------------------------------------------------------------
+  # Net interest income (simplified: mortgage interest minus deposit interest, per quarter). Forecast two ways:
+  #   direct            each method forecasts NII dollars itself
+  #   rate x balance    each method forecasts the four parts above; NII is rebuilt from them
+  - name: nii
+    label: Net interest income (mortgages less deposits), five banks
+    file: data/panel_system_data.csv
+    bank_column: bank_name
+    expression: (mortgage_rate * mortgage_balance - deposit_rate * deposit_balance) / 400
+    form: dlog
+    signs: data/macro_metadata.csv
+    units: $ millions a quarter
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+    rate_x_balance:            # the same expression over forecast parts
+      parts: [mortgage_rate, mortgage_balance, deposit_rate, deposit_balance]

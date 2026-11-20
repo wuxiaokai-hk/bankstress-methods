@@ -1,0 +1,347 @@
+"""One self-contained HTML report: what each method is, how it did out-of-sample, and the scenario forecasts."""
+import base64
+import html
+import io
+import os
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np               # noqa: E402
+import pandas as pd              # noqa: E402
+
+from .evaluate import METHOD_LABELS  # noqa: E402
+
+INK, MUTED, GRID = "#1f2933", "#6b7785", "#e4e7eb"
+COLORS = {"bma": "#1b4f8a", "combination": "#2a9d8f", "class": "#c08a1e", "ar1": "#8e6c8a",
+          "drift": "#9aa5b1", "random_walk": "#c94f4f"}
+SCEN_COLORS = {"baseline": "#1b4f8a", "upside": "#2a9d8f", "downside": "#c08a1e", "severe": "#c94f4f"}
+
+SOURCES = [
+    ("IMF Global Financial Stability Report, Oct 2020, Online Annex 4.1 (Global Solvency Stress Test)",
+     "https://www.imf.org/-/media/Files/Publications/GFSR/2020/October/English/onlineannex41.ashx"),
+    ("Guerrieri & Welch (2012), Can Macro Variables Used in Stress Testing Forecast the Performance of Banks? "
+     "Fed FEDS 2012-49", "https://www.federalreserve.gov/pubs/feds/2012/201249/index.html"),
+    ("Hirtle, Kovner, Vickery & Bhanot (2016), The CLASS model, NY Fed Staff Report 663",
+     "https://www.newyorkfed.org/research/staff_reports/sr663.html"),
+    ("Federal Reserve, Supervisory Stress Test Model Documentation: PPNR models",
+     "https://www.federalreserve.gov/supervisionreg/files/pre-provision-net-revenue-models.pdf"),
+    ("Federal Reserve, 2025 Supervisory Stress Test Methodology: Descriptions of Supervisory Models",
+     "https://www.federalreserve.gov/publications/2025-june-supervisory-stress-test-methodology-descriptions-supervisory-models.htm"),
+]
+
+METHOD_TEXT = [
+    ("bma", "IMF: Bayesian model averaging with sign constraints",
+     "At every origin the candidate drivers (series with an expected sign in the target's sign file) are screened "
+     "on their partial correlation with the target; the best 10 with the right sign are kept (at most 2 per theme, "
+     "no near-duplicates), each at its best lag 0-2. Every combination of 0 to 3 of them is estimated as "
+     "y<sub>i,t</sub> = a<sub>i</sub> + &rho; y<sub>i,t-1</sub> + &Sigma; b<sub>k</sub> x<sub>k,t-lag</sub> with bank fixed effects. "
+     "Equations whose long-run multipliers b<sub>k</sub>/(1&minus;&rho;) have the wrong sign are discarded. "
+     "The forecast is the average of the remaining equations weighted by exp(&minus;BIC/2), which is Bayesian "
+     "model averaging with equal prior odds. Nothing is selected: every admissible equation contributes."),
+    ("combination", "Guerrieri &amp; Welch (Fed): forecast combination",
+     "One equation per macro variable: y<sub>t</sub> on y<sub>t-1</sub> and lags 1-4 of that variable (bank effects in a "
+     "panel). The 10 variables most correlated with the target are used (signs are not imposed, as in the paper). "
+     "The forecast is the equal-weighted average of the equations."),
+    ("class", "NY Fed CLASS-style: one fixed, simple equation",
+     "One small equation per target with drivers chosen on economic grounds (set in config.yaml under "
+     "class_drivers), estimated on the panel, and kept identical at every origin. A transparent challenger."),
+    ("rxb", "Federal Reserve: income = rate &times; balance",
+     "For an income target, each method forecasts the parts (rates and balances) and the income is rebuilt from them "
+     "with the same formula, instead of forecasting the dollar amount itself. Shown as &ldquo;method (rate x balance)&rdquo;."),
+    ("bench", "Benchmarks", "AR(1) with bank effects; drift (the bank's average change); random walk (no change)."),
+    ("conf", "Conformal bands",
+     "The 80% and 95% bands come from the out-of-sample errors of the same method at the same horizon "
+     "(finite-sample conformal quantiles of log errors for balances, of differences for rates). The coverage columns "
+     "check them honestly: at each origin the band is built only from errors already known at that origin, "
+     "then compared with what happened."),
+]
+
+
+def _png(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _ax(ax):
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color(GRID)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.grid(axis="y", color=GRID, lw=0.6)
+    ax.set_axisbelow(True)
+
+
+def _color(m):
+    base = m.split(" (")[0]
+    return COLORS.get(base, "#555")
+
+
+def _label(m):
+    base = m.split(" (")[0]
+    lab = METHOD_LABELS.get(base, base)
+    return lab + (" &mdash; rate &times; balance" if "rate x balance" in m else "")
+
+
+def _plain(m):
+    return html.unescape(_label(m).replace("&mdash;", "-").replace("&times;", "x"))
+
+
+def chart_horizon(s):
+    byh = s["byh"]
+    show = list(s["lb"].index[:6])
+    if "random_walk" in byh.index and "random_walk" not in show:
+        show.append("random_walk")
+    fig, ax = plt.subplots(figsize=(6.4, 3.0))
+    for m in show:
+        ax.plot(byh.columns, byh.loc[m].values, color=_color(m), lw=2.2 if m == show[0] else 1.4,
+                ls="--" if "rate x balance" in m else "-", label=_plain(m))
+    ax.set_xlabel("Quarters ahead", color=MUTED, fontsize=8)
+    ax.set_ylabel(f"Average error ({s['target'].error_units()})", color=MUTED, fontsize=8)
+    _ax(ax)
+    ax.legend(fontsize=7, frameon=False, ncol=2, loc="upper left")
+    return _png(fig)
+
+
+def chart_scenarios(s, macro, best, H, levels):
+    t = s["target"]
+    tot = s["scen_total"][best]
+    hist = _hist_total(t)
+    hist = hist[hist.index > macro.hist_end - 24]
+    fut = [macro.hist_end + h for h in range(0, H + 1)]
+    fig, ax = plt.subplots(figsize=(6.4, 3.2))
+    ax.plot([q.to_timestamp() for q in hist.index], hist.values, color=INK, lw=1.8, label="History")
+    x = [q.to_timestamp() for q in fut]
+    last = hist.iloc[-1]
+    for sc, by in tot.items():
+        p = np.r_[last, by["Total"]]
+        c = SCEN_COLORS.get(sc, "#555")
+        ax.plot(x, p, color=c, lw=1.8, label=sc)
+        if sc in ("baseline", "severe"):
+            for lv, a in zip(sorted(levels), (0.22, 0.10)):
+                lo, hi = [], []
+                for h in range(1, H + 1):
+                    ql, qh = s["qt"].get((best, h), {}).get(lv, (np.nan, np.nan))
+                    v = by["Total"][h - 1]
+                    lo.append(v * np.exp(ql) if t.form == "dlog" else v + ql)
+                    hi.append(v * np.exp(qh) if t.form == "dlog" else v + qh)
+                ax.fill_between(x[1:], lo, hi, color=c, alpha=a, lw=0)
+    ax.axvline(x[0], color=GRID, lw=1)
+    ax.set_ylabel(t.units, color=MUTED, fontsize=8)
+    _ax(ax)
+    ax.legend(fontsize=7, frameon=False, ncol=3, loc="upper left")
+    return _png(fig)
+
+
+def chart_methods_severe(s, macro, H, scen="severe"):
+    t = s["target"]
+    hist = _hist_total(t)
+    hist = hist[hist.index > macro.hist_end - 16]
+    x = [q.to_timestamp() for q in [macro.hist_end + h for h in range(0, H + 1)]]
+    fig, ax = plt.subplots(figsize=(6.4, 3.0))
+    ax.plot([q.to_timestamp() for q in hist.index], hist.values, color=INK, lw=1.8, label="History")
+    for m, by in s["scen_total"].items():
+        if scen not in by:
+            continue
+        ax.plot(x, np.r_[hist.iloc[-1], by[scen]["Total"]], color=_color(m),
+                ls="--" if "rate x balance" in m else "-", lw=1.4, label=_plain(m))
+    ax.set_ylabel(t.units, color=MUTED, fontsize=8)
+    _ax(ax)
+    ax.legend(fontsize=6.5, frameon=False, ncol=2, loc="upper left")
+    return _png(fig)
+
+
+def chart_pip(s, macro):
+    pip = s["fits"]["bma"].info["pip"]
+    items = sorted(pip.items(), key=lambda kv: kv[1])
+    if not items:
+        return None
+    fig, ax = plt.subplots(figsize=(6.4, 0.32 * len(items) + 0.6))
+    labels = [f"{macro.describe(v)[:46]} (lag {l})" for (v, l), _ in items]
+    ax.barh(labels, [p for _, p in items], color=COLORS["bma"], height=0.6)
+    ax.set_xlim(0, 1)
+    ax.set_xlabel("Inclusion probability (share of BMA weight)", color=MUTED, fontsize=8)
+    _ax(ax)
+    ax.grid(axis="x", color=GRID, lw=0.6)
+    ax.grid(axis="y", visible=False)
+    return _png(fig)
+
+
+def _hist_total(t):
+    df = pd.DataFrame(t.levels)
+    return df.sum(axis=1, min_count=1) if t.form == "dlog" else df.mean(axis=1)
+
+
+def _fmt(v, d=3):
+    return "" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:,.{d}f}"
+
+
+def lb_table(s):
+    lb = s["lb"]
+    head = ("<tr><th>#</th><th>Method</th><th>Average error 1-12q</th><th>h1</th><th>h4</th><th>h8</th><th>h12</th>"
+            "<th>vs random walk</th><th>vs AR(1)</th><th>Beats RW (share of origins)</th>"
+            "<th>80% band coverage</th><th>95% band coverage</th></tr>")
+    rows = []
+    for i, (m, r) in enumerate(lb.iterrows(), 1):
+        rows.append(
+            f"<tr class='{ 'best' if i == 1 else ''}'><td>{i}</td><td><span class='dot' style='background:{_color(m)}'></span>"
+            f"{_label(m)}</td><td><b>{_fmt(r['avg_err'])}</b></td><td>{_fmt(r.get('h1'))}</td><td>{_fmt(r.get('h4'))}</td>"
+            f"<td>{_fmt(r.get('h8'))}</td><td>{_fmt(r.get('h12'))}</td>"
+            f"<td>{_fmt(r.get('vs_random_walk_pct'), 0)}%</td><td>{_fmt(r.get('vs_ar1_pct'), 0)}%</td>"
+            f"<td>{_fmt(r.get('beats_rw_share') * 100 if pd.notna(r.get('beats_rw_share')) else np.nan, 0)}%</td>"
+            f"<td>{_fmt(r.get('coverage_80', np.nan) * 100, 0)}%</td><td>{_fmt(r.get('coverage_95', np.nan) * 100, 0)}%</td></tr>")
+    return f"<table class='lb'>{head}{''.join(rows)}</table>"
+
+
+def bma_table(s, macro):
+    top = s["fits"]["bma"].info["top"][:5]
+    rows = []
+    for e in top:
+        d = "<br>".join(f"{html.escape(macro.describe(v))} (lag {l}): {b:+.4f}" for (v, l), b in zip(e["drivers"], e["beta"])) \
+            or "<i>no macro driver (AR only)</i>"
+        rows.append(f"<tr><td>{e['weight'] * 100:.1f}%</td><td>{e['rho']:.2f}</td><td>{d}</td></tr>")
+    return ("<table class='small'><tr><th>BMA weight</th><th>&rho;</th><th>Drivers and coefficients</th></tr>"
+            + "".join(rows) + "</table>")
+
+
+def class_line(s, macro):
+    f = s["fits"].get("class")
+    if f is None:
+        return ""
+    parts = [f"{html.escape(macro.describe(k.split('@')[0]))} (lag {k.split('@')[1]}): {v:+.4f}" for k, v in f.info["coef"].items()]
+    return f"<p class='note'><b>CLASS-style equation:</b> &rho; = {f.info['rho']:.2f}; " + "; ".join(parts) + "</p>"
+
+
+def range_html(s, macro):
+    rc = s["range"]
+    if rc is None or not len(rc):
+        return "<p class='note'>No BMA driver leaves its historical range in any scenario.</p>"
+    rows = "".join(f"<tr><td>{html.escape(macro.describe(r.driver))}</td><td>{r.scenario}</td>"
+                   f"<td>{r.quarters_below_history}</td><td>{r.quarters_above_history}</td>"
+                   f"<td>{r.scenario_min:.4f} / {r.history_min:.4f}</td><td>{r.scenario_max:.4f} / {r.history_max:.4f}</td></tr>"
+                   for r in rc.itertuples())
+    return ("<p class='note'>Scenario values outside the range seen in history (the equations extrapolate there):</p>"
+            "<table class='small'><tr><th>Driver</th><th>Scenario</th><th>Quarters below</th><th>Quarters above</th>"
+            "<th>Min: scenario / history</th><th>Max: scenario / history</th></tr>" + rows + "</table>")
+
+
+def write(summary, macro, cfg, out, quick=False):
+    H = int(cfg["horizon"])
+    levels = cfg["intervals"]["levels"]
+    nav, body = [], []
+
+    # overview
+    ov = []
+    for n, s in summary.items():
+        lb = s["lb"]
+        best = lb.index[0]
+        rank_bma = list(lb.index).index("bma") + 1 if "bma" in lb.index else None
+        ov.append(f"<tr><td><a href='#{n}'>{html.escape(s['target'].label)}</a></td><td>{_label(best)}</td>"
+                  f"<td>{_fmt(lb.loc[best, 'avg_err'])} {html.escape(s['target'].error_units())}</td>"
+                  f"<td>{_fmt(lb.loc[best].get('vs_random_walk_pct'), 0)}%</td>"
+                  f"<td>{_fmt(lb.loc[best].get('vs_ar1_pct'), 0)}%</td><td>{rank_bma}</td>"
+                  f"<td>{_fmt(lb.loc[best].get('coverage_80', np.nan) * 100, 0)}%</td></tr>")
+    first_o = cfg["oos"]["start"]
+    body.append(f"""
+<section id='overview'><h1>Public stress-testing methods, compared out-of-sample</h1>
+<p class='lead'>Each target is forecast with methods published by the IMF, the Federal Reserve and the New York Fed,
+and with three benchmarks. Every method is re-estimated at every origin from {first_o} on (every
+{'quarter' if cfg['oos'].get('step', 1) == 1 else str(cfg['oos'].get('step')) + ' quarters'}), using only data up to that origin,
+and forecasts 1&ndash;{H} quarters ahead with the macro values that actually happened. Errors are on the level:
+percent of the actual level for balances and income, units (percentage points) for rates.
+{'<b>Quick run: origins every 4th quarter.</b>' if quick else ''}</p>
+<table class='lb'><tr><th>Target</th><th>Most accurate method</th><th>Its average error</th><th>vs random walk</th>
+<th>vs AR(1)</th><th>Rank of IMF BMA</th><th>80% band coverage</th></tr>{''.join(ov)}</table>
+</section>""")
+    nav.append("<a href='#overview'>Overview</a>")
+
+    mt = "".join(f"<h3>{t}</h3><p>{d}</p>" for _, t, d in METHOD_TEXT)
+    src = "".join(f"<li><a href='{u}'>{html.escape(t)}</a></li>" for t, u in SOURCES)
+    body.append(f"<section id='methods'><h2>The methods</h2>{mt}<h3>Sources</h3><ul>{src}</ul></section>")
+    nav.append("<a href='#methods'>The methods</a>")
+
+    for n, s in summary.items():
+        t = s["target"]
+        best = s["lb"].index[0]
+        rxb = ""
+        if any("rate x balance" in m for m in s["lb"].index):
+            lb = s["lb"]
+            pairs = []
+            for m in [i for i in lb.index if "(" not in i]:
+                k = f"{m} (rate x balance)"
+                if k in lb.index:
+                    d, c = lb.loc[m, "avg_err"], lb.loc[k, "avg_err"]
+                    pairs.append(f"<tr><td>{_label(m)}</td><td>{_fmt(d)}</td><td>{_fmt(c)}</td>"
+                                 f"<td>{_fmt((1 - c / d) * 100, 0)}%</td></tr>")
+            rxb = ("<h3>Federal Reserve approach: forecast the parts, then multiply</h3>"
+                   "<table class='small'><tr><th>Method</th><th>Direct: forecast income itself</th>"
+                   "<th>Rate &times; balance</th><th>Improvement</th></tr>" + "".join(pairs) + "</table>")
+        pip_img = chart_pip(s, macro)
+        body.append(f"""
+<section id='{n}'><h2>{html.escape(t.label)}</h2>
+<p class='note'>{len(t.banks)} bank{'s' if len(t.banks) > 1 else ''}; modelled as {'log growth' if t.form == 'dlog' else 'quarterly change'};
+errors in {html.escape(t.error_units())}; {len(s['signs'])} signed candidate drivers.</p>
+{lb_table(s)}
+{rxb}
+<div class='grid'>
+<figure><img src='{chart_horizon(s)}'><figcaption>Average error by horizon (out-of-sample).</figcaption></figure>
+<figure><img src='{chart_scenarios(s, macro, best, H, levels)}'><figcaption>Scenarios with the most accurate method
+({_label(best)}){', total of the banks' if len(t.banks) > 1 and t.form == 'dlog' else ', average of the banks' if len(t.banks) > 1 else ''}.
+Shaded: 80% and 95% conformal bands for baseline and severe.</figcaption></figure>
+<figure><img src='{chart_methods_severe(s, macro, H)}'><figcaption>Severe scenario: every method.</figcaption></figure>
+{f"<figure><img src='{pip_img}'><figcaption>IMF BMA on all the data: how much of the weight each screened driver carries.</figcaption></figure>" if pip_img else ''}
+</div>
+<h3>IMF BMA: the five heaviest equations (all data)</h3>
+<p class='note'>{s['fits']['bma'].info['n_models']} equations passed the sign check and share the weight.</p>
+{bma_table(s, macro)}
+{class_line(s, macro)}
+<h3>Scenario range check</h3>
+{range_html(s, macro)}
+</section>""")
+        nav.append(f"<a href='#{n}'>{html.escape(t.label)}</a>")
+
+    body.append("""
+<section id='notes'><h2>Reading the results</h2>
+<ul>
+<li>The test is conditional on the macro path that happened. That is the right test for scenario models, but real
+forecasts also carry the error of the macro forecast itself.</li>
+<li>The coverage columns should be close to 80% and 95%. They are computed in real time: early bands are built from the
+errors of the calm years only, and then meet the shocks of 2020 and 2022, so coverage below the nominal level is the usual
+result and an honest warning. The scenario bands are wider, because they use every out-of-sample error, shocks included.</li>
+<li>The example data are simulated. On them the true drivers are known (see the data notes of the main project), so
+the BMA inclusion probabilities can be checked against the truth; on real data they are evidence, not proof.</li>
+<li>All equations are in changes. A target that is pulled back towards a level (a rate that tracks a bond yield,
+say) is better served by an error-correction term, which none of these published methods uses by default.</li>
+</ul></section>""")
+    nav.append("<a href='#notes'>Reading the results</a>")
+
+    page = f"""<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Public stress-testing methods compared</title><style>
+body{{margin:0;font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:{INK};background:#fafbfc}}
+nav{{position:fixed;top:0;left:0;width:230px;height:100vh;overflow:auto;background:#fff;border-right:1px solid {GRID};padding:20px 14px;box-sizing:border-box}}
+nav a{{display:block;color:{MUTED};text-decoration:none;padding:5px 8px;border-radius:6px;font-size:13px}}
+nav a:hover{{background:#eef2f7;color:{INK}}}
+main{{margin-left:230px;padding:28px 44px;max-width:1180px}}
+section{{background:#fff;border:1px solid {GRID};border-radius:10px;padding:22px 26px;margin-bottom:22px}}
+h1{{font-size:24px;margin:0 0 8px}} h2{{font-size:19px;margin:0 0 6px}} h3{{font-size:15px;margin:18px 0 6px}}
+.lead{{color:#3e4c59;max-width:900px}} .note{{color:{MUTED};font-size:13px}}
+table{{border-collapse:collapse;width:100%;margin:8px 0;font-size:12.5px}}
+th{{text-align:left;color:{MUTED};font-weight:600;border-bottom:1px solid {GRID};padding:6px 8px}}
+td{{border-bottom:1px solid #f0f2f5;padding:6px 8px;font-variant-numeric:tabular-nums}}
+tr.best td{{background:#f2f7fc}}
+.dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px}}
+.grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}}
+figure{{margin:0}} figure img{{width:100%}} figcaption{{color:{MUTED};font-size:12px}}
+a{{color:#1b4f8a}}
+@media(max-width:900px){{nav{{display:none}} main{{margin-left:0;padding:14px}} .grid{{grid-template-columns:1fr}}}}
+</style></head><body><nav><b style='display:block;margin:0 8px 12px'>Contents</b>{''.join(nav)}</nav>
+<main>{''.join(body)}</main></body></html>"""
+    path = os.path.join(out, "report.html")
+    with open(path, "w") as f:
+        f.write(page)
+    return path
