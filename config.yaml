@@ -22,7 +22,42 @@ candidates:
   max_lag: 2                  # each driver enters at one lag, 0..max_lag, chosen when screening
   n_screen: 10                # keep the 10 best-correlated, correctly signed drivers at each origin
   max_per_theme: 2            # at most 2 drivers from the same theme
-  max_corr: 0.85              # skip a driver nearly identical to one already kept
+
+# ---- How drivers may enter the equations. Put any of these under a target to apply them to that target only.
+restrictions:
+  signs: true                 # false: no sign restrictions at all (every driver gets a free sign)
+  apply_to: [bma]             # which methods impose the expected signs: bma, combination, class
+                              #   bma          equations with a wrong-signed long-run effect are dropped
+                              #   combination  equations whose summed lag coefficients have the wrong sign are dropped
+                              #   class        a wrong sign is flagged in the report (the equation is fixed)
+  free_sign: []               # drivers kept as candidates but with no sign restriction, e.g. [FRTB3M.IC]
+  include_unsigned: false     # true: series without an expected sign may also enter (with a free sign)
+  exclude: []                 # never used, e.g. [FHPI.IC]
+  force_in: []                # in every BMA equation (and every combination equation): VAR or VAR@lag,
+                              #   e.g. [FHPI.ION@1]. If the data give it the wrong sign in every equation,
+                              #   its sign check is dropped and the report says so.
+  not_together: []            # groups of which an equation holds at most one, e.g. [[FYPD.ION, FYPD.IC]]
+  max_corr: 0.85              # two screened drivers more correlated than this are not both kept; null = no limit
+
+# ---- Panel or bank by bank. Put this under a target to set it for that target only.
+estimation:
+  mode: panel                 # panel: banks pooled with bank fixed effects
+                              # separate: every bank estimated on its own (its own drivers, BMA, report section)
+  banks: all                  # all, or a list of names, e.g. [Bank A, Bank C]
+
+# ---- How methods are ranked, and against what.
+ranking:
+  metric: mean                # mean      average error (for balances: % of the level, a MAPE)
+                              # rmse      root mean squared error: large deviations weigh more
+                              # p90       the error exceeded in 10% of cases
+                              # cvar      average of the worst tail_share of errors: how bad the bad cases are
+                              # worst     the single largest error
+                              # combined  mean + penalty x (cvar - mean): average, plus a charge for bad cases
+                              # Each is computed at every horizon and averaged over 1..horizon.
+  tail_share: 0.10            # the "worst 10%" used by cvar and combined
+  penalty: 0.5                # combined: 0 = plain average, 1 = tail only
+  compare_against: [random_walk, ar1]    # benchmarks shown as "vs ..." columns; any method can be one,
+                                         # e.g. [class] or ["bma (rate x balance)"]
 
 horizon: 12                   # quarters ahead (errors are averaged over 1..12)
 
@@ -37,6 +72,8 @@ intervals:
   min_calibration: 12         # errors needed before a band is computed in the honest coverage check
 
 methods:
+  run: [bma, combination, class, ar1, drift, random_walk]   # which methods to estimate (benchmarks named in
+                                                            # ranking.compare_against are always added)
   bma:                        # IMF Global Solvency Stress Test: panel fixed effects, BMA, sign constraints
     max_vars: 3               # models with 0..3 macro drivers (all subsets of the screened drivers)
   combination:                # Guerrieri & Welch (2012): one regression per macro variable, lags 1..4, averaged
@@ -46,7 +83,6 @@ methods:
     enabled: true             # the drivers are set per target (class_drivers). In this example every balance
                               # uses the same generic set (GDP, unemployment, house prices, short rate) and every
                               # rate the same market rates, so the challenger is not tuned to the data.
-  benchmarks: [random_walk, drift, ar1]
 
 targets:
   # --- one bank ----------------------------------------------------------------------------------------
@@ -81,6 +117,10 @@ targets:
     signs: data/macro_metadata.csv
     units: $ millions
     class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+    # Settings for this target only (they override the global ones above), for example:
+    # estimation: {mode: separate, banks: [Bank A, Bank B]}
+    # restrictions: {force_in: [FHPI.ION@1], not_together: [[FYPD.ION, FYPD.IC]]}
+    # ranking: {metric: cvar, compare_against: [class]}
 
   - name: mortgage_balance
     label: Mortgage balances, five banks

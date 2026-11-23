@@ -71,16 +71,44 @@ class Macro:
 
 
 def load_signs(path, macro, cfg):
-    """{mnemonic: +1/-1} for the candidate drivers of one target."""
+    """{mnemonic: +1 / -1 / 0} for the candidate drivers of one target (0 = sign not restricted).
+
+    The pool is the series with an expected sign in the sign file, in the allowed geographies and themes.
+    restrictions (see config.yaml) then change it:
+        include_unsigned  also series the sign file leaves without a sign (they enter with a free sign)
+        exclude           never used
+        free_sign         kept, but their sign is not restricted
+        force_in          added even if the filters above would drop them
+    """
     cc = cfg["candidates"]
-    m = pd.read_csv(path).set_index("mnemonic")
-    m = m[m["expected_sign"].fillna(0).astype(int) != 0]
+    rs = cfg.get("restrictions", {})
+    raw = pd.read_csv(path).set_index("mnemonic")
+    raw = raw[~raw.index.duplicated(keep="first")]
+    sign = raw["expected_sign"].fillna(0).astype(float).apply(np.sign).astype(int)
+    m = raw if rs.get("include_unsigned") else raw[sign != 0]
     if cc.get("geographies"):
         m = m[m["geography"].isin(cc["geographies"])]
     if cc.get("exclude_themes"):
         m = m[~m["theme"].isin(cc["exclude_themes"])]
-    m = m[m.index.isin(macro.levels[macro.scenarios[0]].columns)]
-    return {k: int(np.sign(v)) for k, v in m["expected_sign"].items()}
+    cols = set(macro.levels[macro.scenarios[0]].columns)
+    out = {k: int(sign.get(k, 0)) for k in m.index if k in cols}
+    for v in _names(rs.get("exclude")):
+        out.pop(v, None)
+    for v in _names(rs.get("force_in")):
+        if v not in cols:
+            raise ValueError(f"restrictions.force_in: {v} is not a macro series")
+        out[v] = int(sign.get(v, 0))
+    for v in _names(rs.get("free_sign")):
+        if v in out:
+            out[v] = 0
+    if not rs.get("signs", True):
+        out = {k: 0 for k in out}
+    return out
+
+
+def _names(lst):
+    """Variable names from a list of 'VAR' or 'VAR@lag' entries."""
+    return [str(x).split("@")[0].strip() for x in (lst or [])]
 
 
 def themes(macro):
@@ -122,6 +150,20 @@ class Target:
         events = _events(tc, base, bc != "_bank")
         self.y = {b: self._organic(s, events.get(b, {})) for b, s in self.levels.items()}
         self.banks = sorted(self.levels)
+
+    def subset(self, banks, name=None, label=None):
+        """The same target with only some banks (estimated on their own data)."""
+        import copy
+        t = copy.copy(self)
+        missing = [b for b in banks if b not in self.levels]
+        if missing:
+            raise ValueError(f"{self.name}: no bank named {missing}; banks are {self.banks}")
+        t.levels = {b: self.levels[b] for b in banks}
+        t.y = {b: self.y[b] for b in banks}
+        t.banks = sorted(banks)
+        t.name = name or self.name
+        t.label = label or self.label
+        return t
 
     def _organic(self, s, ev):
         y = np.log(s).diff() if self.form == "dlog" else s.diff()

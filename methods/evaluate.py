@@ -34,19 +34,42 @@ def first_row(macro, cfg):
     return x.index[0] + lags + 1          # x starts with a NaN (the first change), then needs `lags` lags
 
 
+ALL_METHODS = ["bma", "combination", "class", "ar1", "drift", "random_walk"]
+
+
+def methods_to_run(cfg):
+    """methods.run (default: all), plus every benchmark named in ranking.compare_against."""
+    run = list(cfg["methods"].get("run") or ALL_METHODS)
+    for b in (cfg.get("ranking", {}) or {}).get("compare_against") or []:
+        base = b.split(" (")[0]
+        if base not in run:
+            run.append(base)
+    bad = [m for m in run if m not in ALL_METHODS]
+    if bad:
+        raise ValueError(f"methods.run: unknown {bad}; choose from {ALL_METHODS}")
+    return run
+
+
 def fit_all(target, macro, signs, themes, origin, cfg, first):
-    """Every method on data up to `origin`: {method: ModelSet}."""
+    """Every chosen method on data up to `origin`: {method: ModelSet}."""
     rows = M.Rows(target, macro.history(), origin, first)
+    restr = M.Restrictions(cfg)
+    run = methods_to_run(cfg)
     out = {}
-    screened = M.screen(rows, signs, themes, cfg, signed=True)
-    out["bma"] = M.bma(rows, screened, signs, cfg)
-    out["bma"].info["screened"] = screened
-    cs = M.screen(rows, signs, themes, cfg, signed=False, n_keep=cfg["methods"]["combination"].get("n_vars", 10))
-    out["combination"] = M.combination(rows, cs, cfg)
-    if cfg["methods"].get("class", {}).get("enabled", True) and target.cfg.get("class_drivers"):
-        out["class"] = M.fixed(rows, parse_drivers(target.cfg["class_drivers"]), "class")
-    for b in cfg["methods"].get("benchmarks", ["random_walk", "drift", "ar1"]):
-        out[b] = getattr(M, b)(rows)
+    if "bma" in run:
+        screened = M.screen(rows, signs, themes, cfg, signed=restr.uses_signs("bma"), restr=restr)
+        out["bma"] = M.bma(rows, screened, signs, cfg, restr)
+        out["bma"].info["screened"] = screened
+    if "combination" in run:
+        cs = M.screen(rows, signs, themes, cfg, signed=restr.uses_signs("combination"),
+                      n_keep=cfg["methods"]["combination"].get("n_vars", 10), restr=restr)
+        out["combination"] = M.combination(rows, cs, cfg, signs, restr)
+    if "class" in run and cfg["methods"].get("class", {}).get("enabled", True) and target.cfg.get("class_drivers"):
+        out["class"] = M.fixed(rows, parse_drivers(target.cfg["class_drivers"]), "class", signs,
+                               check_signs=restr.uses_signs("class"))
+    for b in ("random_walk", "drift", "ar1"):
+        if b in run:
+            out[b] = getattr(M, b)(rows)
     return out
 
 
@@ -150,21 +173,72 @@ def errors(target, fc, act, H):
     return pd.DataFrame(rec, columns=["method", "origin", "bank", "h", "abs_err", "err"])
 
 
-def leaderboard(E, H):
-    """Average error over 1..H, by method (mean over origins, banks and horizons with equal horizon weight)."""
-    byh = E.groupby(["method", "h"])["abs_err"].mean().unstack("h")
-    out = pd.DataFrame({"avg_err": byh.mean(axis=1)})
+METRICS = {
+    "mean": "Average error",
+    "rmse": "Root mean squared error",
+    "p90": "90th percentile of errors",
+    "cvar": "Average of the worst errors (tail)",
+    "worst": "Largest single error",
+    "combined": "Average + penalty x tail excess",
+}
+
+
+def _metrics(a, tail_share, penalty):
+    """Error metrics of one set of absolute errors."""
+    a = np.sort(np.asarray(a, float))
+    n = len(a)
+    if not n:
+        return {k: np.nan for k in METRICS}
+    k = max(int(np.ceil(n * tail_share)), 1)
+    mean = a.mean()
+    cvar = a[-k:].mean()
+    return {"mean": mean, "rmse": float(np.sqrt((a ** 2).mean())), "p90": float(np.quantile(a, 0.9)),
+            "cvar": float(cvar), "worst": float(a[-1]), "combined": float(mean + penalty * (cvar - mean))}
+
+
+def leaderboard(E, H, ranking=None):
+    """One row per method, ordered by the ranking metric.
+
+    Every metric is computed horizon by horizon over all origins and banks, then averaged over horizons 1..H,
+    so long horizons (whose errors are naturally larger) do not dominate the tail metrics.
+
+        mean      average absolute error (for balances: % of the level, i.e. a MAPE)
+        rmse      root mean squared error: squares the errors, so large deviations weigh more
+        p90       the error exceeded in 10% of cases
+        cvar      average of the worst tail_share of errors (expected shortfall): how bad the bad cases are
+        worst     the single largest error, at any horizon (not averaged)
+        combined  mean + penalty * (cvar - mean): the average, plus a charge for the excess of the bad cases
+    """
+    ranking = ranking or {}
+    metric = ranking.get("metric", "mean")
+    if metric not in METRICS:
+        raise ValueError(f"ranking.metric must be one of {list(METRICS)}")
+    tail, pen = float(ranking.get("tail_share", 0.10)), float(ranking.get("penalty", 0.5))
+    per = {}
+    for (m, h), g in E.groupby(["method", "h"]):
+        per[(m, h)] = _metrics(g["abs_err"].values, tail, pen)
+    P = pd.DataFrame(per).T
+    P.index.names = ["method", "h"]
+    out = P.groupby(level="method").mean()
+    out["worst"] = E.groupby("method")["abs_err"].max()            # the single largest error, any horizon
+    out.insert(0, "score", out[metric])
+    byh = P[metric].unstack("h")
+    means = P["mean"].unstack("h")
     for h in (1, 4, 8, H):
-        if h in byh.columns:
-            out[f"h{h}"] = byh[h]
-    for ref in ("random_walk", "ar1"):
+        if h in means.columns:
+            out[f"h{h}"] = means[h]
+    refs = ranking.get("compare_against") or ["random_walk", "ar1"]
+    for ref in refs:
         if ref in out.index:
-            out[f"vs_{ref}_pct"] = (1 - out["avg_err"] / out.loc[ref, "avg_err"]) * 100
-    # how often the method beats the random walk, origin by origin (bank-averaged, horizon-averaged)
+            out[f"vs_{ref}_pct"] = (1 - out["score"] / out.loc[ref, "score"]) * 100
+    # how often the method beats the first benchmark, origin by origin (bank- and horizon-averaged)
     po = E.groupby(["method", "origin"])["abs_err"].mean().unstack("method")
-    if "random_walk" in po.columns:
-        out["beats_rw_share"] = [(po[m] < po["random_walk"]).mean() if m in po else np.nan for m in out.index]
-    return out.sort_values("avg_err"), byh
+    ref = next((r for r in refs if r in po.columns), None)
+    if ref:
+        out[f"beats_{ref}_share"] = [(po[m] < po[ref]).mean() if m in po else np.nan for m in out.index]
+    out = out.rename(columns={"mean": "avg_err"})
+    out.attrs.update(metric=metric, refs=[r for r in refs if r in out.index], tail_share=tail, penalty=pen)
+    return out.sort_values("score"), byh
 
 
 def conformal_quantiles(E, levels):

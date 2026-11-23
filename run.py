@@ -39,7 +39,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"))
     ap.add_argument("--quick", action="store_true", help="origins every 4th quarter")
-    ap.add_argument("--targets", nargs="*", help="only these targets (parts of a rate x balance target are added)")
+    ap.add_argument("--targets", nargs="*", help="only these targets (parts of a rate x balance target run as needed)")
+    ap.add_argument("--mode", choices=["panel", "separate"], help="override estimation.mode for every target")
+    ap.add_argument("--banks", nargs="*", help="override estimation.banks for every target (names, or: all)")
+    ap.add_argument("--metric", choices=["mean", "rmse", "p90", "cvar", "worst", "combined"],
+                    help="override ranking.metric")
     ap.add_argument("--no-report", action="store_true")
     a = ap.parse_args(argv)
 
@@ -48,6 +52,16 @@ def main(argv=None):
     base = os.path.dirname(os.path.abspath(a.config))
     if a.quick:
         cfg["oos"]["step"] = 4
+    if a.mode or a.banks:
+        cfg["estimation"] = dict(cfg.get("estimation") or {})
+        if a.mode:
+            cfg["estimation"]["mode"] = a.mode
+        if a.banks:
+            cfg["estimation"]["banks"] = "all" if a.banks == ["all"] else a.banks
+        for t in cfg["targets"]:
+            t.pop("estimation", None)
+    if a.metric:
+        cfg["ranking"] = dict(cfg.get("ranking") or {}, metric=a.metric)
     out = os.path.join(base, cfg.get("output_dir", "outputs"))
     os.makedirs(out, exist_ok=True)
     H = int(cfg["horizon"])
@@ -60,62 +74,91 @@ def main(argv=None):
 
     tcs = {t["name"]: t for t in cfg["targets"]}
     want = a.targets or list(tcs)
-    for n in list(want):
-        for p in (tcs[n].get("rate_x_balance") or {}).get("parts", []):
-            if p not in want:
-                want.insert(0, p)
-    order = [n for n in tcs if n in want and not tcs[n].get("rate_x_balance")] + \
-            [n for n in tcs if n in want and tcs[n].get("rate_x_balance")]
+    unknown = [n for n in want if n not in tcs]
+    if unknown:
+        raise SystemExit(f"Unknown targets {unknown}; the config has {list(tcs)}")
+    order = [n for n in tcs if n in want]
 
     cache = {}
-    T, RES, SCEN, FITS = {}, {}, {}, {}
+    done = {}            # (target, mode, banks) -> {unit: (target, results, scenarios, fits, signs)}
     summary = {}
-    for n in order:
-        tc = tcs[n]
-        t = D.Target(tc, base, cache)
-        signs = D.load_signs(os.path.join(base, tc["signs"]), macro, cfg)
-        print(f"\n{t.label}: {len(t.banks)} bank(s), form {t.form}, {len(signs)} signed candidate drivers")
-        r = V.run_target(t, macro, signs, themes, cfg)
-        sc, fits = V.scenarios(t, macro, signs, themes, cfg)
+
+    def estimate(tc, tcfg, est, banks):
+        """Run one target in one estimation mode for some banks; parts of rate x balance first."""
+        key = (tc["name"], est["mode"], tuple(banks))
+        if key in done:
+            return done[key]
+        t = D.Target(tc, base, cache).subset(banks)
+        signs = D.load_signs(os.path.join(base, tc["signs"]), macro, tcfg)
+        units = {}
+        if est["mode"] == "panel":
+            units[tc["name"]] = t
+        else:
+            for b in banks:
+                units[f"{tc['name']} | {b}"] = t.subset([b], name=f"{tc['name']} | {b}", label=f"{t.label} - {b}")
+        res = {}
+        for u, tu in units.items():
+            print(f"\n{tu.label}: {len(tu.banks)} bank(s), {est['mode']}, form {tu.form}, {len(signs)} candidate drivers "
+                  f"({sum(1 for v in signs.values() if v)} with a sign restriction)")
+            r = V.run_target(tu, macro, signs, themes, tcfg)
+            sc, fits = V.scenarios(tu, macro, signs, themes, tcfg)
+            res[u] = (tu, r, sc, fits, signs)
         rxb = tc.get("rate_x_balance")
         if rxb:
             parts = rxb["parts"]
-            cf = V.compose(t, parts, RES)
-            cs = V.compose_scenarios(t, parts, SCEN)
-            for m in cf:
-                r["fc"][f"{m} (rate x balance)"] = cf[m]
-            for m in cs:
-                sc[f"{m} (rate x balance)"] = cs[m]
-        T[n], RES[n], SCEN[n], FITS[n] = t, r, sc, fits
+            pres = {p: estimate(tcs[p], settings(cfg, tcs[p], est), est, banks) for p in parts}
+            for u, (tu, r, sc, fits, signs) in res.items():
+                suffix = u[len(tc["name"]):]                      # '' (panel) or ' | Bank A'
+                R_ = {p: pres[p][p + suffix][1] for p in parts}
+                S_ = {p: pres[p][p + suffix][2] for p in parts}
+                for m, f in V.compose(tu, parts, R_).items():
+                    r["fc"][f"{m} (rate x balance)"] = f
+                for m, f in V.compose_scenarios(tu, parts, S_).items():
+                    sc[f"{m} (rate x balance)"] = f
+        done[key] = res
+        return res
 
-        # ---- scores
-        E = V.errors(t, r["fc"], r["act"], H)
-        lb, byh = V.leaderboard(E, H)
-        cov = V.coverage(E, levels, cfg["intervals"]["min_calibration"])
-        for lv in levels:
-            lb[f"coverage_{int(lv * 100)}"] = [cov.get(m, {}).get(lv, np.nan) for m in lb.index]
-        q = V.conformal_quantiles(E, levels)
+    for n in order:
+        tc = tcs[n]
+        tcfg = settings(cfg, tc)
+        est = tcfg["estimation"]
+        allbanks = D.Target(tc, base, cache).banks
+        banks = allbanks if est.get("banks", "all") in ("all", None) else [str(b) for b in est["banks"]]
+        res = estimate(tc, tcfg, est, banks)
+        for u, (t, r, sc, fits, signs) in res.items():
+            # ---- scores
+            E = V.errors(t, r["fc"], r["act"], H)
+            lb, byh = V.leaderboard(E, H, tcfg.get("ranking"))
+            cov = V.coverage(E, levels, cfg["intervals"]["min_calibration"])
+            for lv in levels:
+                lb[f"coverage_{int(lv * 100)}"] = [cov.get(m, {}).get(lv, np.nan) for m in lb.index]
+            q = V.conformal_quantiles(E, levels)
 
-        # totals (sum of banks / average rate) for charts and their own bands
-        fct = {m: total_by_origin(byo, t.form) for m, byo in r["fc"].items()}
-        actt = total_by_origin(r["act"], t.form)
-        Et = V.errors(t, fct, actt, H)
-        qt = V.conformal_quantiles(Et, levels)
-        sct = {m: total(byscen, t.form) for m, byscen in sc.items() if not m.startswith("_")}
+            # totals (sum of banks / average rate) for charts and their own bands
+            fct = {m: total_by_origin(byo, t.form) for m, byo in r["fc"].items()}
+            actt = total_by_origin(r["act"], t.form)
+            Et = V.errors(t, fct, actt, H)
+            qt = V.conformal_quantiles(Et, levels)
+            sct = {m: total(byscen, t.form) for m, byscen in sc.items() if not m.startswith("_")}
 
-        rc = V.range_check(fits, macro, H)
-        summary[n] = {"target": t, "lb": lb, "byh": byh, "E": E, "q": q, "qt": qt, "scen": sc, "scen_total": sct,
-                      "fits": fits, "range": rc, "signs": signs}
-        print(lb.round(3).to_string())
+            rc = V.range_check(fits, macro, H) if "bma" in fits else pd.DataFrame()
+            summary[u] = {"target": t, "lb": lb, "byh": byh, "E": E, "q": q, "qt": qt, "scen": sc, "scen_total": sct,
+                          "fits": fits, "range": rc, "signs": signs, "settings": tcfg,
+                          "rank": {"metric": lb.attrs.get("metric"), "refs": lb.attrs.get("refs"),
+                                   "tail_share": lb.attrs.get("tail_share"), "penalty": lb.attrs.get("penalty")}}
+            print(lb.drop(columns=[c for c in lb.columns if c.startswith("h")]).round(3).to_string())
 
-        # ---- files
-        E.assign(target=n, origin=E["origin"].astype(str)).to_csv(os.path.join(out, f"errors_{n}.csv"), index=False)
-        _scenario_rows(t, sc, q, sct, qt, macro, levels, H).to_csv(os.path.join(out, f"scenarios_{n}.csv"), index=False)
+            # ---- files
+            safe = u.replace(" | ", "__").replace(" ", "_")
+            E.assign(target=u, origin=E["origin"].astype(str)).to_csv(os.path.join(out, f"errors_{safe}.csv"), index=False)
+            _scenario_rows(t, sc, q, sct, qt, macro, levels, H).to_csv(os.path.join(out, f"scenarios_{safe}.csv"), index=False)
 
     lbs = pd.concat({n: s["lb"] for n, s in summary.items()}, names=["target", "method"]).reset_index()
     lbs.to_csv(os.path.join(out, "leaderboards.csv"), index=False)
     pip = []
     for n, s in summary.items():
+        if "bma" not in s["fits"]:
+            continue
         bm = s["fits"]["bma"]
         for (v, l), p in bm.info["pip"].items():
             pip.append({"target": n, "driver": v, "lag": l, "inclusion_probability": p,
@@ -132,6 +175,36 @@ def main(argv=None):
         print(f"\nReport: {path}")
     print(f"Done in {time.time() - t0:.0f} s. Outputs in {out}")
     return summary
+
+
+DEFAULT_SETTINGS = {
+    "estimation": {"mode": "panel", "banks": "all"},
+    "restrictions": {"signs": True, "apply_to": ["bma"], "free_sign": [], "force_in": [], "exclude": [],
+                     "not_together": [], "include_unsigned": False},
+    "ranking": {"metric": "mean", "tail_share": 0.10, "penalty": 0.5, "compare_against": ["random_walk", "ar1"]},
+}
+
+
+def _merge(a, b):
+    out = dict(a)
+    for k, v in (b or {}).items():
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def settings(cfg, tc, est=None):
+    """The config seen by one target: defaults < global settings < the target's own settings.
+    est forces the estimation mode and banks (the parts of a rate x balance target follow the target)."""
+    c = _merge(cfg, {})
+    for k, d in DEFAULT_SETTINGS.items():
+        c[k] = _merge(_merge(d, cfg.get(k)), tc.get(k))
+    if tc.get("methods"):
+        c["methods"] = _merge(cfg["methods"], tc["methods"])
+    if est is not None:
+        c["estimation"] = dict(est)
+    if c["estimation"]["mode"] not in ("panel", "separate"):
+        raise SystemExit(f"{tc['name']}: estimation.mode must be panel or separate")
+    return c
 
 
 def total_by_origin(byo, form):

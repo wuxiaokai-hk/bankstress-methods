@@ -11,7 +11,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np               # noqa: E402
 import pandas as pd              # noqa: E402
 
-from .evaluate import METHOD_LABELS  # noqa: E402
+from .evaluate import METHOD_LABELS, METRICS  # noqa: E402
+import re  # noqa: E402
 
 INK, MUTED, GRID = "#1f2933", "#6b7785", "#e4e7eb"
 COLORS = {"bma": "#1b4f8a", "combination": "#2a9d8f", "class": "#c08a1e", "ar1": "#8e6c8a",
@@ -101,7 +102,7 @@ def chart_horizon(s):
         ax.plot(byh.columns, byh.loc[m].values, color=_color(m), lw=2.2 if m == show[0] else 1.4,
                 ls="--" if "rate x balance" in m else "-", label=_plain(m))
     ax.set_xlabel("Quarters ahead", color=MUTED, fontsize=8)
-    ax.set_ylabel(f"Average error ({s['target'].error_units()})", color=MUTED, fontsize=8)
+    ax.set_ylabel(f"{METRICS[s['rank']['metric']]} ({s['target'].error_units()})", color=MUTED, fontsize=8)
     _ax(ax)
     ax.legend(fontsize=7, frameon=False, ncol=2, loc="upper left")
     return _png(fig)
@@ -156,6 +157,8 @@ def chart_methods_severe(s, macro, H, scen="severe"):
 
 
 def chart_pip(s, macro):
+    if "bma" not in s["fits"]:
+        return None
     pip = s["fits"]["bma"].info["pip"]
     items = sorted(pip.items(), key=lambda kv: kv[1])
     if not items:
@@ -180,21 +183,68 @@ def _fmt(v, d=3):
     return "" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:,.{d}f}"
 
 
+REF_LABELS = {"random_walk": "random walk", "ar1": "AR(1)", "drift": "drift", "class": "CLASS-style",
+              "combination": "combination", "bma": "IMF BMA"}
+
+
+def _ref(r):
+    base = r.split(" (")[0]
+    return REF_LABELS.get(base, base) + (" (rate x balance)" if "rate x balance" in r else "")
+
+
+def _slug(n):
+    return re.sub(r"[^A-Za-z0-9]+", "-", n).strip("-")
+
+
 def lb_table(s):
-    lb = s["lb"]
-    head = ("<tr><th>#</th><th>Method</th><th>Average error 1-12q</th><th>h1</th><th>h4</th><th>h8</th><th>h12</th>"
-            "<th>vs random walk</th><th>vs AR(1)</th><th>Beats RW (share of origins)</th>"
-            "<th>80% band coverage</th><th>95% band coverage</th></tr>")
+    lb, rk = s["lb"], s["rank"]
+    met = rk["metric"]
+    refs = rk.get("refs") or []
+    cols = [("avg_err", "Average error"), ("rmse", "RMSE"), ("p90", "90th pct"),
+            ("cvar", f"Tail: worst {rk['tail_share'] * 100:.0f}%"), ("worst", "Largest"),
+            ("combined", f"Average + {rk['penalty']:g} &times; tail excess")]
+    key = "avg_err" if met == "mean" else met
+    head = ("<tr><th>#</th><th>Method</th>" + "".join(
+        f"<th class='{'rk' if k == key else ''}'>{lab}{' &#9650;' if k == key else ''}</th>" for k, lab in cols)
+        + "".join(f"<th>vs {_ref(r)}</th>" for r in refs)
+        + (f"<th>Beats {_ref(refs[0])} (share of origins)</th>" if refs else "")
+        + "<th>80% band coverage</th><th>95% band coverage</th></tr>")
     rows = []
+    beats = f"beats_{refs[0]}_share" if refs else None
     for i, (m, r) in enumerate(lb.iterrows(), 1):
+        cells = "".join(f"<td class='{'rk' if k == key else ''}'>{'<b>' if k == key else ''}{_fmt(r.get(k))}"
+                        f"{'</b>' if k == key else ''}</td>" for k, _ in cols)
+        vs = "".join(f"<td>{_fmt(r.get(f'vs_{ref}_pct'), 0)}%</td>" for ref in refs)
+        bt = (f"<td>{_fmt(r.get(beats) * 100 if pd.notna(r.get(beats)) else np.nan, 0)}%</td>" if beats else "")
         rows.append(
-            f"<tr class='{ 'best' if i == 1 else ''}'><td>{i}</td><td><span class='dot' style='background:{_color(m)}'></span>"
-            f"{_label(m)}</td><td><b>{_fmt(r['avg_err'])}</b></td><td>{_fmt(r.get('h1'))}</td><td>{_fmt(r.get('h4'))}</td>"
-            f"<td>{_fmt(r.get('h8'))}</td><td>{_fmt(r.get('h12'))}</td>"
-            f"<td>{_fmt(r.get('vs_random_walk_pct'), 0)}%</td><td>{_fmt(r.get('vs_ar1_pct'), 0)}%</td>"
-            f"<td>{_fmt(r.get('beats_rw_share') * 100 if pd.notna(r.get('beats_rw_share')) else np.nan, 0)}%</td>"
+            f"<tr class='{'best' if i == 1 else ''}'><td>{i}</td><td><span class='dot' style='background:{_color(m)}'></span>"
+            f"{_label(m)}</td>{cells}{vs}{bt}"
             f"<td>{_fmt(r.get('coverage_80', np.nan) * 100, 0)}%</td><td>{_fmt(r.get('coverage_95', np.nan) * 100, 0)}%</td></tr>")
     return f"<table class='lb'>{head}{''.join(rows)}</table>"
+
+
+def settings_html(s, macro):
+    st = s["settings"]
+    est, rs = st["estimation"], st["restrictions"]
+    bits = [f"Estimation: <b>{'panel (banks pooled, bank fixed effects)' if est['mode'] == 'panel' else 'each bank on its own'}</b>"]
+    if rs.get("signs", True):
+        bits.append("sign restrictions on: " + ", ".join(sorted(rs.get("apply_to", ["bma"]))))
+    else:
+        bits.append("sign restrictions <b>off</b>")
+    for k, lab in (("force_in", "always in"), ("exclude", "excluded"), ("free_sign", "free sign")):
+        if rs.get(k):
+            bits.append(f"{lab}: " + ", ".join(html.escape(str(v)) for v in rs[k]))
+    if rs.get("not_together"):
+        bits.append("not together: " + "; ".join("{" + ", ".join(map(str, g)) + "}" for g in rs["not_together"]))
+    if rs.get("include_unsigned"):
+        bits.append("unsigned series allowed (free sign)")
+    w = s["fits"].get("class")
+    if w is not None and w.info.get("wrong_sign"):
+        bits.append("<b>CLASS-style equation has a wrong sign:</b> " + ", ".join(w.info["wrong_sign"]))
+    c = s["fits"].get("combination")
+    if c is not None and c.info.get("dropped_for_sign"):
+        bits.append(f"combination: {len(c.info['dropped_for_sign'])} equation(s) dropped for a wrong sign")
+    return "<p class='note'>" + " &middot; ".join(bits) + "</p>"
 
 
 def bma_table(s, macro):
@@ -206,6 +256,15 @@ def bma_table(s, macro):
         rows.append(f"<tr><td>{e['weight'] * 100:.1f}%</td><td>{e['rho']:.2f}</td><td>{d}</td></tr>")
     return ("<table class='small'><tr><th>BMA weight</th><th>&rho;</th><th>Drivers and coefficients</th></tr>"
             + "".join(rows) + "</table>")
+
+
+def bma_block(s, macro):
+    if "bma" not in s["fits"]:
+        return ""
+    i = s["fits"]["bma"].info
+    warn = f"<p class='note'><b>Warning:</b> {html.escape(i['warning'])}</p>" if i.get("warning") else ""
+    return (f"<h3>IMF BMA: the five heaviest equations (all data)</h3><p class='note'>{i['n_models']} of {i['n_tried']} "
+            f"equations passed the restrictions and share the weight.</p>" + warn + bma_table(s, macro))
 
 
 def class_line(s, macro):
@@ -240,10 +299,12 @@ def write(summary, macro, cfg, out, quick=False):
         lb = s["lb"]
         best = lb.index[0]
         rank_bma = list(lb.index).index("bma") + 1 if "bma" in lb.index else None
-        ov.append(f"<tr><td><a href='#{n}'>{html.escape(s['target'].label)}</a></td><td>{_label(best)}</td>"
-                  f"<td>{_fmt(lb.loc[best, 'avg_err'])} {html.escape(s['target'].error_units())}</td>"
-                  f"<td>{_fmt(lb.loc[best].get('vs_random_walk_pct'), 0)}%</td>"
-                  f"<td>{_fmt(lb.loc[best].get('vs_ar1_pct'), 0)}%</td><td>{rank_bma}</td>"
+        ref = (s["rank"].get("refs") or [None])[0]
+        ov.append(f"<tr><td><a href='#{_slug(n)}'>{html.escape(s['target'].label)}</a></td><td>{_label(best)}</td>"
+                  f"<td>{METRICS[s['rank']['metric']]}</td>"
+                  f"<td>{_fmt(lb.loc[best, 'score'])} {html.escape(s['target'].error_units())}</td>"
+                  f"<td>{_fmt(lb.loc[best, 'avg_err'])}</td>"
+                  f"<td>{(_fmt(lb.loc[best].get(f'vs_{ref}_pct'), 0) + '% vs ' + _ref(ref)) if ref else ''}</td><td>{rank_bma or ''}</td>"
                   f"<td>{_fmt(lb.loc[best].get('coverage_80', np.nan) * 100, 0)}%</td></tr>")
     first_o = cfg["oos"]["start"]
     body.append(f"""
@@ -254,8 +315,11 @@ and with three benchmarks. Every method is re-estimated at every origin from {fi
 and forecasts 1&ndash;{H} quarters ahead with the macro values that actually happened. Errors are on the level:
 percent of the actual level for balances and income, units (percentage points) for rates.
 {'<b>Quick run: origins every 4th quarter.</b>' if quick else ''}</p>
-<table class='lb'><tr><th>Target</th><th>Most accurate method</th><th>Its average error</th><th>vs random walk</th>
-<th>vs AR(1)</th><th>Rank of IMF BMA</th><th>80% band coverage</th></tr>{''.join(ov)}</table>
+<p class='lead'>Methods are ranked by the metric chosen in <code>ranking.metric</code>. The tail metrics (RMSE, 90th
+percentile, the average of the worst errors, the largest error) punish a method that is right on average but
+sometimes deviates a lot; every metric is computed at each horizon and averaged over horizons 1&ndash;{H}.</p>
+<table class='lb'><tr><th>Target</th><th>Best method</th><th>Ranked by</th><th>Its score</th><th>Its average error</th>
+<th>vs benchmark</th><th>Rank of IMF BMA</th><th>80% band coverage</th></tr>{''.join(ov)}</table>
 </section>""")
     nav.append("<a href='#overview'>Overview</a>")
 
@@ -274,7 +338,7 @@ percent of the actual level for balances and income, units (percentage points) f
             for m in [i for i in lb.index if "(" not in i]:
                 k = f"{m} (rate x balance)"
                 if k in lb.index:
-                    d, c = lb.loc[m, "avg_err"], lb.loc[k, "avg_err"]
+                    d, c = lb.loc[m, "score"], lb.loc[k, "score"]
                     pairs.append(f"<tr><td>{_label(m)}</td><td>{_fmt(d)}</td><td>{_fmt(c)}</td>"
                                  f"<td>{_fmt((1 - c / d) * 100, 0)}%</td></tr>")
             rxb = ("<h3>Federal Reserve approach: forecast the parts, then multiply</h3>"
@@ -282,27 +346,27 @@ percent of the actual level for balances and income, units (percentage points) f
                    "<th>Rate &times; balance</th><th>Improvement</th></tr>" + "".join(pairs) + "</table>")
         pip_img = chart_pip(s, macro)
         body.append(f"""
-<section id='{n}'><h2>{html.escape(t.label)}</h2>
-<p class='note'>{len(t.banks)} bank{'s' if len(t.banks) > 1 else ''}; modelled as {'log growth' if t.form == 'dlog' else 'quarterly change'};
-errors in {html.escape(t.error_units())}; {len(s['signs'])} signed candidate drivers.</p>
+<section id='{_slug(n)}'><h2>{html.escape(t.label)}</h2>
+<p class='note'>{len(t.banks)} bank{'s' if len(t.banks) > 1 else ''} ({html.escape(', '.join(t.banks))}); modelled as {'log growth' if t.form == 'dlog' else 'quarterly change'};
+errors in {html.escape(t.error_units())}; {len(s['signs'])} candidate drivers, {sum(1 for v in s['signs'].values() if v)} with a sign restriction.
+Ranked by: <b>{METRICS[s['rank']['metric']]}</b>.</p>
+{settings_html(s, macro)}
 {lb_table(s)}
 {rxb}
 <div class='grid'>
-<figure><img src='{chart_horizon(s)}'><figcaption>Average error by horizon (out-of-sample).</figcaption></figure>
+<figure><img src='{chart_horizon(s)}'><figcaption>{METRICS[s['rank']['metric']]} by horizon (out-of-sample).</figcaption></figure>
 <figure><img src='{chart_scenarios(s, macro, best, H, levels)}'><figcaption>Scenarios with the most accurate method
 ({_label(best)}){', total of the banks' if len(t.banks) > 1 and t.form == 'dlog' else ', average of the banks' if len(t.banks) > 1 else ''}.
 Shaded: 80% and 95% conformal bands for baseline and severe.</figcaption></figure>
 <figure><img src='{chart_methods_severe(s, macro, H)}'><figcaption>Severe scenario: every method.</figcaption></figure>
 {f"<figure><img src='{pip_img}'><figcaption>IMF BMA on all the data: how much of the weight each screened driver carries.</figcaption></figure>" if pip_img else ''}
 </div>
-<h3>IMF BMA: the five heaviest equations (all data)</h3>
-<p class='note'>{s['fits']['bma'].info['n_models']} equations passed the sign check and share the weight.</p>
-{bma_table(s, macro)}
+{bma_block(s, macro)}
 {class_line(s, macro)}
 <h3>Scenario range check</h3>
 {range_html(s, macro)}
 </section>""")
-        nav.append(f"<a href='#{n}'>{html.escape(t.label)}</a>")
+        nav.append(f"<a href='#{_slug(n)}'>{html.escape(t.label)}</a>")
 
     body.append("""
 <section id='notes'><h2>Reading the results</h2>
@@ -333,7 +397,7 @@ h1{{font-size:24px;margin:0 0 8px}} h2{{font-size:19px;margin:0 0 6px}} h3{{font
 table{{border-collapse:collapse;width:100%;margin:8px 0;font-size:12.5px}}
 th{{text-align:left;color:{MUTED};font-weight:600;border-bottom:1px solid {GRID};padding:6px 8px}}
 td{{border-bottom:1px solid #f0f2f5;padding:6px 8px;font-variant-numeric:tabular-nums}}
-tr.best td{{background:#f2f7fc}}
+tr.best td{{background:#f2f7fc}} th.rk{{color:#1b4f8a}} code{{background:#f0f2f5;padding:1px 4px;border-radius:4px}}
 .dot{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px}}
 .grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}}
 figure{{margin:0}} figure img{{width:100%}} figcaption{{color:{MUTED};font-size:12px}}

@@ -10,6 +10,8 @@ pip install -r requirements.txt
 python run.py            # full test, about 2 minutes on the example data
 python run.py --quick    # origins every 4th quarter, about 30 seconds
 python run.py --targets loans_panel nii
+python run.py --mode separate --banks "Bank A" "Bank C"     # each bank on its own, two banks
+python run.py --metric cvar                                 # rank by the average of the worst 10% of errors
 ```
 
 Open `outputs/report.html`.
@@ -24,6 +26,55 @@ Open `outputs/report.html`.
 | **Rate × balance** | Federal Reserve supervisory PPNR models | For income, each method forecasts the parts (rates and balances); the income is rebuilt from them instead of being forecast in dollars. |
 | **Benchmarks** | | AR(1) with bank effects, drift (average growth), random walk (no change). |
 | **Conformal bands** | | 80% / 95% bands from each method's own out-of-sample errors at each horizon, with a real-time coverage check. |
+
+## Your choices
+
+All in `config.yaml`; `restrictions`, `estimation`, `ranking` and `methods` can also be set under one target to
+apply to that target only.
+
+**How drivers may enter (`restrictions`)**
+
+| Option | Effect |
+|---|---|
+| `signs: false` | No sign restrictions at all. |
+| `apply_to: [bma, combination, class]` | Which methods impose the expected signs. BMA drops wrong-signed equations; the combination drops equations whose summed lag coefficients have the wrong sign; the CLASS-style equation is fixed, so a wrong sign is flagged in the report. |
+| `free_sign: [VAR]` | Keep a driver, without a sign restriction. |
+| `include_unsigned: true` | Series with no expected sign may also enter, with a free sign. |
+| `exclude: [VAR]` | Never use a driver. |
+| `force_in: [VAR@lag]` | A driver in every BMA (and combination) equation. If the data give it the wrong sign everywhere, its sign check is dropped and the report warns. |
+| `not_together: [[A, B]]` | An equation may hold at most one of A and B (e.g. the same series for two regions). |
+| `max_corr: 0.85` | Two screened drivers more correlated than this are not both kept; `null` for no limit. |
+
+**Panel or bank by bank (`estimation`)**
+
+* `mode: panel`: banks pooled, with bank fixed effects (one set of driver effects for all).
+* `mode: separate`: each bank on its own: its own screening, BMA, scores and report section.
+* `banks: all` or a list of names, e.g. `[Bank A, Bank C]`. In panel mode only those banks are pooled.
+  A rate x balance target runs its parts with the same mode and banks.
+
+**What a method is compared with (`ranking.compare_against`, `methods.run`)**
+
+* `methods.run`: which methods to estimate.
+* `compare_against`: the benchmarks shown as "vs ..." columns and in "beats ... (share of origins)". Any method can
+  be a benchmark, e.g. `[class]` or `["bma (rate x balance)"]`.
+
+**How methods are ranked (`ranking.metric`)**
+
+The average error rewards a method that is right on average even if it sometimes deviates a lot. To penalise
+those large deviations, rank by one of the tail metrics:
+
+| Metric | Meaning |
+|---|---|
+| `mean` | Average error (for balances, % of the actual level: a MAPE). |
+| `rmse` | Root mean squared error: squaring makes large deviations weigh more. |
+| `p90` | The error exceeded in 10% of cases. |
+| `cvar` | Average of the worst `tail_share` (default 10%) of errors: how bad the bad cases are. |
+| `worst` | The single largest error. |
+| `combined` | mean + `penalty` × (cvar − mean): the average, plus a charge for how much worse the bad cases are. `penalty: 0` is the plain average, `1` the tail only. |
+
+Every metric is computed at each horizon over all origins and banks and then averaged over horizons 1–12, so the
+naturally larger long-horizon errors don't dominate (except `worst`, the largest error at any horizon). The
+leaderboard always shows all of them, whichever is used for the ranking.
 
 ## How the test works
 
@@ -53,7 +104,7 @@ Open `outputs/report.html`.
 | File | What |
 |---|---|
 | `report.html` | Overview, the methods, and per target: leaderboard, error by horizon, scenarios with bands, every method under the severe scenario, BMA inclusion probabilities and heaviest equations, the CLASS equation, a scenario range check. |
-| `leaderboards.csv` | Every method and target: average error 1–12, h1/h4/h8/h12, vs random walk and AR(1), share of origins beating the random walk, band coverage. |
+| `leaderboards.csv` | Every method and target (or target and bank): the ranking score, average error, RMSE, 90th percentile, tail average, largest error, combined score, h1/h4/h8/h12, vs each benchmark, share of origins beating the first benchmark, band coverage. |
 | `errors_<target>.csv` | Every out-of-sample error (method, origin, bank, horizon). |
 | `scenarios_<target>.csv` | Scenario forecasts by method, scenario, bank (and total), with 80% / 95% bands. |
 | `bma_inclusion.csv` | Inclusion probability of each screened driver in the final BMA. |
