@@ -39,6 +39,22 @@ restrictions:
   not_together: []            # groups of which an equation holds at most one, e.g. [[FYPD.ION, FYPD.IC]]
   max_corr: 0.85              # two screened drivers more correlated than this are not both kept; null = no limit
 
+# ---- Accounting identities between targets (forecasts made to add up).
+# An identity is imposed only when every target in it is forecast in the run (enforce: auto), so a run of one or
+# two targets ignores it. identities_on: false (or --identities off) ignores them all.
+identities_on: true
+identities:
+  - name: Loans add up
+    equation: total_loans = mortgage_balance + commercial_balance    # linear: name, number*name, + and -
+    method: reconcile         # reconcile: every target moves, the least certain forecasts the most
+                              # residual: one target takes the whole gap (set residual: total_loans)
+    weights: errors           # reconcile weights: errors (out-of-sample error variance), size, or equal
+    enforce: auto             # auto | true (stop if a target is missing) | false (ignore this one)
+  # - name: Funding
+  #   equation: total_loans = deposit_balance + wholesale_funding + equity - liquid_assets
+  #   method: residual
+  #   residual: wholesale_funding
+
 # ---- Panel or bank by bank. Put this under a target to set it for that target only.
 estimation:
   mode: panel                 # panel: banks pooled with bank fixed effects
@@ -139,6 +155,16 @@ targets:
     bank_column: bank_name
     form: dlog
     signs: data/macro_metadata_commercial_loans.csv
+    units: $ millions
+    class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
+
+  - name: total_loans
+    label: Total loans (mortgages + commercial), five banks
+    file: data/panel_system_data.csv
+    bank_column: bank_name
+    expression: mortgage_balance + commercial_balance
+    form: dlog
+    signs: data/macro_metadata.csv
     units: $ millions
     class_drivers: [FGDPR.ION@0, FLBR.ION@0, FHPI.ION@1, FRTB3M.IC@1]
 

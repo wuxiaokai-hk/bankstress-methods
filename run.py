@@ -21,6 +21,7 @@ sys.path.insert(0, HERE)
 from methods import data as D          # noqa: E402
 from methods import evaluate as V      # noqa: E402
 from methods import report as R        # noqa: E402
+from methods import identities as I    # noqa: E402
 
 
 def total(fc_or_act, form):
@@ -44,6 +45,7 @@ def main(argv=None):
     ap.add_argument("--banks", nargs="*", help="override estimation.banks for every target (names, or: all)")
     ap.add_argument("--metric", choices=["mean", "rmse", "p90", "cvar", "worst", "combined"],
                     help="override ranking.metric")
+    ap.add_argument("--identities", choices=["on", "off"], help="override identities_on")
     ap.add_argument("--no-report", action="store_true")
     a = ap.parse_args(argv)
 
@@ -118,14 +120,28 @@ def main(argv=None):
         done[key] = res
         return res
 
+    # ---- 1. estimate every target (and the parts of rate x balance targets)
+    units = {}
     for n in order:
         tc = tcs[n]
         tcfg = settings(cfg, tc)
         est = tcfg["estimation"]
         allbanks = D.Target(tc, base, cache).banks
         banks = allbanks if est.get("banks", "all") in ("all", None) else [str(b) for b in est["banks"]]
-        res = estimate(tc, tcfg, est, banks)
-        for u, (t, r, sc, fits, signs) in res.items():
+        for u, (t, r, sc, fits, signs) in estimate(tc, tcfg, est, banks).items():
+            units[u] = {"base": n, "suffix": u[len(n):], "target": t, "r": r, "sc": sc, "fits": fits,
+                        "signs": signs, "settings": tcfg}
+
+    # ---- 2. accounting identities between targets
+    idents = [I.Identity(x) for x in cfg.get("identities") or []]
+    E0 = {u: V.errors(x["target"], x["r"]["fc"], x["r"]["act"], H) for u, x in units.items()} if idents else {}
+    switch = cfg.get("identities_on", True) if a.identities is None else a.identities == "on"
+    ident_report = I.apply(idents, units, E0, H, switch=switch)
+
+    # ---- 3. scores, bands, files
+    for u, x in units.items():
+        t, r, sc, fits, signs, tcfg = x["target"], x["r"], x["sc"], x["fits"], x["signs"], x["settings"]
+        if True:
             # ---- scores
             E = V.errors(t, r["fc"], r["act"], H)
             lb, byh = V.leaderboard(E, H, tcfg.get("ranking"))
@@ -144,14 +160,19 @@ def main(argv=None):
             rc = V.range_check(fits, macro, H) if "bma" in fits else pd.DataFrame()
             summary[u] = {"target": t, "lb": lb, "byh": byh, "E": E, "q": q, "qt": qt, "scen": sc, "scen_total": sct,
                           "fits": fits, "range": rc, "signs": signs, "settings": tcfg,
+                          "identities": [d for d in ident_report if x["base"] in I.parse(d["equation"])],
                           "rank": {"metric": lb.attrs.get("metric"), "refs": lb.attrs.get("refs"),
                                    "tail_share": lb.attrs.get("tail_share"), "penalty": lb.attrs.get("penalty")}}
+            print(f"\n{t.label}")
             print(lb.drop(columns=[c for c in lb.columns if c.startswith("h")]).round(3).to_string())
 
             # ---- files
             safe = u.replace(" | ", "__").replace(" ", "_")
             E.assign(target=u, origin=E["origin"].astype(str)).to_csv(os.path.join(out, f"errors_{safe}.csv"), index=False)
             _scenario_rows(t, sc, q, sct, qt, macro, levels, H).to_csv(os.path.join(out, f"scenarios_{safe}.csv"), index=False)
+    if ident_report:
+        pd.DataFrame([{k: (", ".join(v) if isinstance(v, list) else v) for k, v in d.items()} for d in ident_report]
+                     ).to_csv(os.path.join(out, "identities.csv"), index=False)
 
     lbs = pd.concat({n: s["lb"] for n, s in summary.items()}, names=["target", "method"]).reset_index()
     lbs.to_csv(os.path.join(out, "leaderboards.csv"), index=False)

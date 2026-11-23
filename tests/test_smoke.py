@@ -64,3 +64,39 @@ def test_options(tmp_path):
             names = [v for v, _ in e["drivers"]]
             assert "FHPI.ION" in names and "FHPI.IC" not in names
             assert not ({"FYPD.ION", "FYPD.IC"} <= set(names))
+
+
+def _cfg(tmp_path):
+    import yaml
+    cfg = yaml.safe_load(open(os.path.join(HERE, "config.yaml")))
+    cfg["output_dir"] = str(tmp_path)
+    cfg["oos"]["start"] = "2020Q4"
+    cfg["macro"]["metadata"] = os.path.join(HERE, cfg["macro"]["metadata"])
+    cfg["macro"]["scenarios"] = {k: os.path.join(HERE, v) for k, v in cfg["macro"]["scenarios"].items()}
+    for t in cfg["targets"]:
+        for k in ("file", "events", "signs"):
+            if t.get(k):
+                t[k] = os.path.join(HERE, t[k])
+    return cfg
+
+
+def test_identities(tmp_path):
+    """Reconciled forecasts add up exactly; a run without every target ignores the identity."""
+    import yaml
+    for method in ("reconcile", "residual"):
+        cfg = _cfg(tmp_path)
+        cfg["identities"][0].update(method=method, residual="total_loans")
+        cfg["methods"]["run"] = ["bma", "ar1"]
+        p = tmp_path / "c.yaml"
+        p.write_text(yaml.safe_dump(cfg))
+        s = run.main(["--config", str(p), "--quick", "--no-report",
+                      "--targets", "total_loans", "mortgage_balance", "commercial_balance"])
+        m = "bma (identities)"
+        tot, mo, co = (s[n]["scen"][m]["severe"] for n in ("total_loans", "mortgage_balance", "commercial_balance"))
+        for b in tot:
+            assert np.allclose(tot[b], mo[b] + co[b], rtol=1e-10)
+        if method == "residual":     # the parts are untouched
+            assert np.allclose(mo["Bank A"], s["mortgage_balance"]["scen"]["bma"]["severe"]["Bank A"])
+    s = run.main(["--config", str(p), "--quick", "--no-report", "--targets", "mortgage_balance", "commercial_balance"])
+    assert not any("(identities)" in m for m in s["mortgage_balance"]["lb"].index)
+    assert s["mortgage_balance"]["identities"][0]["active"] is False

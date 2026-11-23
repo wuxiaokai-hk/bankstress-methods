@@ -51,6 +51,12 @@ METHOD_TEXT = [
     ("rxb", "Federal Reserve: income = rate &times; balance",
      "For an income target, each method forecasts the parts (rates and balances) and the income is rebuilt from them "
      "with the same formula, instead of forecasting the dollar amount itself. Shown as &ldquo;method (rate x balance)&rdquo;."),
+    ("ident", "Accounting identities",
+     "When targets are linked by an identity (total loans = mortgages + commercial loans, say) and all of them are "
+     "forecast in the run, their forecasts are made to add up: either every target moves a little, the least certain "
+     "forecasts the most (weighted least squares reconciliation, Hyndman et al.), or one target takes the whole gap. "
+     "Shown as &ldquo;method (identities)&rdquo;, next to the unadjusted forecasts. With only some of the targets in "
+     "the run, or <code>identities_on: false</code>, the identity is ignored."),
     ("bench", "Benchmarks", "AR(1) with bank effects; drift (the bank's average change); random walk (no change)."),
     ("conf", "Conformal bands",
      "The 80% and 95% bands come from the out-of-sample errors of the same method at the same horizon "
@@ -85,7 +91,8 @@ def _color(m):
 def _label(m):
     base = m.split(" (")[0]
     lab = METHOD_LABELS.get(base, base)
-    return lab + (" &mdash; rate &times; balance" if "rate x balance" in m else "")
+    return lab + (" &mdash; rate &times; balance" if "rate x balance" in m else "") + \
+        (" &mdash; with identities" if "(identities)" in m else "")
 
 
 def _plain(m):
@@ -100,7 +107,7 @@ def chart_horizon(s):
     fig, ax = plt.subplots(figsize=(6.4, 3.0))
     for m in show:
         ax.plot(byh.columns, byh.loc[m].values, color=_color(m), lw=2.2 if m == show[0] else 1.4,
-                ls="--" if "rate x balance" in m else "-", label=_plain(m))
+                ls="--" if "(" in m else "-", label=_plain(m))
     ax.set_xlabel("Quarters ahead", color=MUTED, fontsize=8)
     ax.set_ylabel(f"{METRICS[s['rank']['metric']]} ({s['target'].error_units()})", color=MUTED, fontsize=8)
     _ax(ax)
@@ -145,11 +152,12 @@ def chart_methods_severe(s, macro, H, scen="severe"):
     x = [q.to_timestamp() for q in [macro.hist_end + h for h in range(0, H + 1)]]
     fig, ax = plt.subplots(figsize=(6.4, 3.0))
     ax.plot([q.to_timestamp() for q in hist.index], hist.values, color=INK, lw=1.8, label="History")
+    best = s["lb"].index[0]
     for m, by in s["scen_total"].items():
-        if scen not in by:
+        if scen not in by or ("(identities)" in m and m != best):
             continue
         ax.plot(x, np.r_[hist.iloc[-1], by[scen]["Total"]], color=_color(m),
-                ls="--" if "rate x balance" in m else "-", lw=1.4, label=_plain(m))
+                ls="--" if "(" in m else "-", lw=1.4, label=_plain(m))
     ax.set_ylabel(t.units, color=MUTED, fontsize=8)
     _ax(ax)
     ax.legend(fontsize=6.5, frameon=False, ncol=2, loc="upper left")
@@ -258,6 +266,35 @@ def bma_table(s, macro):
             + "".join(rows) + "</table>")
 
 
+def identity_block(s):
+    ids = s.get("identities") or []
+    if not ids:
+        return ""
+    out = []
+    lb = s["lb"]
+    for d in ids:
+        if not d["active"]:
+            out.append(f"<p class='note'>Identity <b>{html.escape(d['name'])}</b> ({html.escape(d['equation'])}): "
+                       f"{html.escape(d['reason'])}.</p>")
+            continue
+        how = ("every target adjusted, weighted by " + {"errors": "out-of-sample error variance", "size": "size",
+                                                         "equal": "equal weights"}[d["weights"]]
+               if d["method"] == "reconcile" else f"{html.escape(str(d['residual']))} takes the whole gap")
+        rows = []
+        for m in [i for i in lb.index if "(" not in i]:
+            k = m + " (identities)"
+            if k in lb.index:
+                a_, b_ = lb.loc[m, "score"], lb.loc[k, "score"]
+                rows.append(f"<tr><td>{_label(m)}</td><td>{_fmt(a_)}</td><td>{_fmt(b_)}</td>"
+                            f"<td>{_fmt((1 - b_ / a_) * 100, 1)}%</td></tr>")
+        out.append(f"<h3>Identity: {html.escape(d['name'])}</h3><p class='note'>{html.escape(d['equation'])}; {how}. "
+                   f"Largest gap in history: {_fmt(d['history_gap_pct'], 3)}% of the largest term; the scenario "
+                   f"forecasts moved {_fmt(d['adjust_pct'], 3)}% on average to add up.</p>"
+                   "<table class='small'><tr><th>Method</th><th>Score, own forecast</th><th>Score, with identity</th>"
+                   "<th>Improvement</th></tr>" + "".join(rows) + "</table>")
+    return "".join(out)
+
+
 def bma_block(s, macro):
     if "bma" not in s["fits"]:
         return ""
@@ -336,7 +373,7 @@ sometimes deviates a lot; every metric is computed at each horizon and averaged 
             lb = s["lb"]
             pairs = []
             for m in [i for i in lb.index if "(" not in i]:
-                k = f"{m} (rate x balance)"
+                k = f"{m} (rate x balance)"  # noqa
                 if k in lb.index:
                     d, c = lb.loc[m, "score"], lb.loc[k, "score"]
                     pairs.append(f"<tr><td>{_label(m)}</td><td>{_fmt(d)}</td><td>{_fmt(c)}</td>"
@@ -353,6 +390,7 @@ Ranked by: <b>{METRICS[s['rank']['metric']]}</b>.</p>
 {settings_html(s, macro)}
 {lb_table(s)}
 {rxb}
+{identity_block(s)}
 <div class='grid'>
 <figure><img src='{chart_horizon(s)}'><figcaption>{METRICS[s['rank']['metric']]} by horizon (out-of-sample).</figcaption></figure>
 <figure><img src='{chart_scenarios(s, macro, best, H, levels)}'><figcaption>Scenarios with the most accurate method

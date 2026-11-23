@@ -32,7 +32,40 @@ Open `outputs/report.html`.
 All in `config.yaml`; `restrictions`, `estimation`, `ranking` and `methods` can also be set under one target to
 apply to that target only.
 
-**How drivers may enter (`restrictions`)**
+**Accounting identities between targets (`identities`)**
+
+When several targets are linked, for example total loans = mortgages + commercial loans, or loans = deposits +
+wholesale funding + equity − liquid assets, the separate forecasts need not add up. List the identities and they
+are imposed on the forecasts:
+
+```yaml
+identities_on: true
+identities:
+  - name: Loans add up
+    equation: total_loans = mortgage_balance + commercial_balance   # target names; number*name, + and -
+    method: reconcile        # reconcile: every target moves, the least certain forecasts the most
+                             # residual: one target takes the whole gap (residual: total_loans)
+    weights: errors          # reconcile weights: errors (out-of-sample error variance), size, or equal
+    enforce: auto            # auto: only when every target in it is in the run; true: stop if one is missing;
+                             # false: ignore it
+```
+
+* With `enforce: auto`, a run of only one or two of the targets (`--targets mortgage_balance`) simply ignores the
+  identity. `identities_on: false` or `--identities off` ignores them all.
+* `reconcile` is the weighted least squares projection used in forecast reconciliation (Hyndman et al. 2011;
+  Wickramasuriya, Athanasopoulos & Hyndman 2019): the total adjustment is the smallest possible, shared in
+  proportion to each forecast's error variance at that horizon. In the out-of-sample test the weights use only
+  errors already known at each origin.
+* If the identity does not hold exactly in history (items not modelled), the gap at the forecast origin is carried
+  forward.
+* The adjusted forecasts appear as "method (identities)" next to the unadjusted ones, in the leaderboard, the
+  scenario files and the report, so you can see whether imposing the identity helps. `identities.csv` lists each
+  identity, whether it was imposed and why, the largest gap in history and the average adjustment.
+* Works in panel and bank-by-bank mode (per bank); all targets in an identity need the same mode and banks.
+
+**Rules for the drivers (`restrictions`)**
+
+Optional rules on which macro drivers may enter an equation:
 
 | Option | Effect |
 |---|---|
@@ -136,6 +169,7 @@ config.yaml            data, targets, method settings
 methods/data.py        macro scenarios, sign files, targets (organic change)
 methods/models.py      the equation form, screening, BMA, combination, CLASS-style, benchmarks
 methods/evaluate.py    rolling-origin test, rate x balance, conformal bands, coverage, scenarios, range check
+methods/identities.py  accounting identities between targets (reconcile or residual)
 methods/report.py      the HTML report
 tests/test_smoke.py    a fast end-to-end check (python -m pytest -q)
 ```
