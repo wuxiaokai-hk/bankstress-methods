@@ -19,7 +19,7 @@ The forecast of a ModelSet is the weighted average of its equations' forecasts.
     drift         the bank's average change over the estimation sample.
     random_walk   no change (y = 0): the level stays where it is.
 """
-from itertools import combinations
+from itertools import combinations, product
 
 import numpy as np
 
@@ -52,12 +52,12 @@ class Rows:
         self.counts = np.bincount(self.B, minlength=self.nb).astype(float)
         self.present = self.counts > 0
 
-    def col(self, var, lag):
+    def col(self, var, lag, kind=None):
         s = self.xhist[var].shift(lag)
-        return s.reindex(self.T).values.astype(float)
+        return transform(s.reindex(self.T).values.astype(float), kind)
 
     def X(self, feats):
-        return np.column_stack([self.col(v, l) for v, l in feats]) if feats else np.zeros((self.n, 0))
+        return np.column_stack([self.col(*f) for f in feats]) if feats else np.zeros((self.n, 0))
 
     def means(self, A):
         """Bank means of the columns of A: (nb, k)."""
@@ -70,6 +70,36 @@ class Rows:
     def demean(self, A):
         A = A.reshape(self.n, -1)
         return A - self.means(A)[self.B]
+
+
+def transform(x, kind):
+    """A feature is (var, lag) or (var, lag, kind); kind changes how the macro change x enters:
+        None              x itself
+        '+'               max(x, 0): only increases (asymmetric effects)
+        '-'               min(x, 0): only decreases
+        ('seg', lo, hi)   the part of x inside [lo, hi], measured from lo (one piece of a piecewise-linear curve;
+                          lo = -inf or hi = +inf for the open end pieces, which extrapolate linearly)
+    """
+    if kind is None:
+        return x
+    if kind == "+":
+        return np.maximum(x, 0.0)
+    if kind == "-":
+        return np.minimum(x, 0.0)
+    _, lo, hi = kind
+    if np.isinf(lo):
+        return np.minimum(x, hi) - hi
+    if np.isinf(hi):
+        return np.maximum(x, lo) - lo
+    return np.clip(x, lo, hi) - lo
+
+
+def feat_name(f):
+    v, l = f[0], f[1]
+    k = f[2] if len(f) > 2 else None
+    tag = "" if k is None else (" rising" if k == "+" else " falling" if k == "-" else
+                                f" in [{k[1]:.3g}, {k[2]:.3g}]")
+    return f"{v}@{l}{tag}"
 
 
 class ModelSet:
@@ -93,9 +123,11 @@ class ModelSet:
         M = len(self.rho)
         K = len(self.feats)
         Xf = np.zeros((H, K))
-        for k, (v, l) in enumerate(self.feats):
+        for k, f in enumerate(self.feats):
+            v, l = f[0], f[1]
             s = xpath[v]
-            Xf[:, k] = [s.get(start + h - l, np.nan) for h in range(1, H + 1)]
+            Xf[:, k] = transform(np.array([s.get(start + h - l, np.nan) for h in range(1, H + 1)], float),
+                                 f[2] if len(f) > 2 else None)
         Xf = np.nan_to_num(Xf)
         out = np.zeros((M, H))
         prev = np.full(M, y_last)
@@ -152,8 +184,12 @@ class Restrictions:
         mc = rs.get("max_corr", cfg["candidates"].get("max_corr", 0.85))
         self.max_corr = None if mc in (None, "none", "None") else float(mc)
 
+    FAMILY = {"bma_asym": "bma", "spline": "bma", "hybrid": "bma", "direct": "bma", "direct_class": "class"}
+
     def uses_signs(self, method):
-        return self.signs and method in self.apply_to
+        """Methods built on the BMA's drivers (bma_asym, spline, hybrid, direct) follow 'bma';
+        direct_class follows 'class'; each can also be named on its own in apply_to."""
+        return self.signs and (method in self.apply_to or self.FAMILY.get(method) in self.apply_to)
 
     def allowed(self, names):
         """False if the drivers break a not_together group."""
@@ -235,9 +271,25 @@ def screen(rows, signs, themes, cfg, signed=True, n_keep=None, restr=None):
 
 
 # ------------------------------------------------------------------------------------------------- methods
-def bma(rows, screened, signs, cfg, restr=None, _relax=False):
+def bma(rows, screened, signs, cfg, restr=None, _relax=False, asym=False, name="bma"):
+    """Bayesian model averaging over every admissible equation (IMF GST).
+
+    With asym=True (method bma_asym) each driver may also enter asymmetrically: separate slopes for its rises and
+    its falls, max(x, 0) and min(x, 0). An equation then chooses, for each of its drivers, the symmetric or the
+    asymmetric form; the asymmetric form costs one more parameter in the BIC, so it only gets weight when the data
+    support it. Both slopes must have the expected sign (the effect is monotone, only its strength differs).
+    """
     restr = restr or Restrictions(cfg)
-    feats = [(v, l) for v, l, _ in screened]
+    drivers = [(v, l) for v, l, _ in screened]
+    feats, alts = [], []
+    for v, l in drivers:
+        k = len(feats)
+        feats.append((v, l))
+        a_ = [[k]]
+        if asym:
+            feats += [(v, l, "+"), (v, l, "-")]
+            a_.append([k + 1, k + 2])
+        alts.append(a_)
     K = len(feats)
     X = rows.X(feats)
     Yd = rows.demean(rows.Y)[:, 0]
@@ -245,36 +297,40 @@ def bma(rows, screened, signs, cfg, restr=None, _relax=False):
     Xbar = rows.means(X) if K else np.zeros((rows.nb, 0))
     use = restr.uses_signs("bma")
     forced_names = {v for v, _ in restr.force}
-    sgn = np.array([signs.get(v, 0) if use and not (_relax and v in forced_names) else 0 for v, _ in feats], int)
-    F = [k for k, (v, _) in enumerate(feats) if v in forced_names]
-    free = [k for k in range(K) if k not in F]
+    sgn = np.array([signs.get(f[0], 0) if use and not (_relax and f[0] in forced_names) else 0 for f in feats], int)
+    D = len(drivers)
+    F = [d for d, (v, _) in enumerate(drivers) if v in forced_names]
+    free = [d for d in range(D) if d not in F]
     max_vars = max(cfg["methods"]["bma"].get("max_vars", 3), len(F))
-    rhos, betas, bics, subsets = [], [], [], []
+    rhos, betas, bics, subsets, chosen = [], [], [], [], []
     tried = 0
     for m in range(0, min(max_vars - len(F), len(free)) + 1):
         for extra in combinations(free, m):
-            S = tuple(sorted(F + list(extra)))
-            if not restr.allowed(feats[k][0] for k in S):
+            ds = tuple(sorted(F + list(extra)))
+            if not restr.allowed(drivers[d][0] for d in ds):
                 continue
-            tried += 1
-            cols = [0] + [1 + j for j in S]
-            coef, ssr = _ols(Yd, Zall[:, cols])
-            rho = coef[0]
-            b = np.zeros(K)
-            b[list(S)] = coef[1:]
-            if not (-1 < rho < 1):
-                continue
-            if S and not _sign_ok(b[list(S)], sgn[list(S)]):    # long-run multiplier b/(1-rho), 1-rho > 0
-                continue
-            rhos.append(rho)
-            betas.append(b)
-            bics.append(_bic(ssr, rows.n, 1 + len(S) + int(rows.present.sum())))
-            subsets.append(S)
+            for pick in product(*[range(len(alts[d])) for d in ds]):
+                S = [c for d, p_ in zip(ds, pick) for c in alts[d][p_]]
+                tried += 1
+                cols = [0] + [1 + j for j in S]
+                coef, ssr = _ols(Yd, Zall[:, cols])
+                rho = coef[0]
+                b = np.zeros(K)
+                b[S] = coef[1:]
+                if not (-1 < rho < 1):
+                    continue
+                if S and not _sign_ok(b[S], sgn[S]):    # long-run multiplier b/(1-rho), 1-rho > 0
+                    continue
+                rhos.append(rho)
+                betas.append(b)
+                bics.append(_bic(ssr, rows.n, 1 + len(S) + int(rows.present.sum())))
+                subsets.append(tuple(S))
+                chosen.append(dict(zip(ds, pick)))
     if not rhos:
         if F and not _relax:
             # every equation fails because a forced driver has the wrong sign: keep the forced drivers,
             # drop their sign check, and say so in the report
-            ms = bma(rows, screened, signs, cfg, restr, _relax=True)
+            ms = bma(rows, screened, signs, cfg, restr, _relax=True, asym=asym, name=name)
             ms.info["warning"] = ("No equation passed with the forced drivers' expected signs; their sign check was "
                                   "dropped (the data disagree with the expected sign).")
             return ms
@@ -283,12 +339,24 @@ def bma(rows, screened, signs, cfg, restr=None, _relax=False):
     w = np.exp(-0.5 * (bic - bic.min()))
     w /= w.sum()
     alpha = _alpha(rows, rho, beta, Xbar)
-    pip = {feats[k]: float(w[[k in S for S in subsets]].sum()) for k in range(K)}
+    pip = {drivers[d]: float(sum(wi for wi, c in zip(w, chosen) if d in c)) for d in range(D)}
+    asym_share = {drivers[d]: float(sum(wi for wi, c in zip(w, chosen) if c.get(d) == 1)) for d in range(D)} if asym else {}
     order = np.argsort(-w)[:10]
     top = [{"drivers": [feats[k] for k in subsets[i]], "weight": float(w[i]), "rho": float(rho[i]),
             "beta": [float(beta[i, k]) for k in subsets[i]]} for i in order]
-    return ModelSet("bma", feats, rho, beta, alpha, w,
-                    {"pip": pip, "top": top, "n_models": len(w), "n_tried": tried, "signs_used": use})
+    return ModelSet(name, feats, rho, beta, alpha, w,
+                    {"pip": pip, "asym": asym_share, "top": top, "n_models": len(w), "n_tried": tried,
+                     "signs_used": use})
+
+
+def median_model(ms):
+    """Drivers with inclusion probability >= 0.5 (Barbieri & Berger's median probability model); at least the
+    single heaviest driver if none reaches 0.5."""
+    pip = ms.info.get("pip", {})
+    keep = [d for d, p in pip.items() if p >= 0.5]
+    if not keep and pip:
+        keep = [max(pip, key=pip.get)]
+    return keep
 
 
 def combination(rows, screened, cfg, signs=None, restr=None):
@@ -362,3 +430,237 @@ def drift(rows):
 
 def random_walk(rows):
     return ModelSet("random_walk", [], [0.0], np.zeros((1, 0)), np.zeros((1, rows.nb)), [1.0])
+
+
+# ------------------------------------------------------------------------------------- nonlinear: monotone curves
+def spline(rows, drivers, signs, cfg, restr=None):
+    """Shape-constrained piecewise-linear effects (a monotone linear spline).
+
+    Each driver's effect is a piecewise-linear curve with knots at quantiles of its history (methods.spline.knots,
+    default the terciles). The curve may bend at the knots but, when the driver has an expected sign, every piece
+    must slope that way, so the effect is monotone. Beyond the range of the data the end pieces continue in a
+    straight line, so a severe scenario still moves the forecast. Estimated by bounded least squares with bank
+    fixed effects and y_t-1, like the other equations.
+    """
+    from scipy.optimize import lsq_linear
+
+    restr = restr or Restrictions(cfg)
+    qs = cfg["methods"].get("spline", {}).get("knots", [1 / 3, 2 / 3])
+    use = restr.uses_signs("spline")
+    feats, lb, ub = [], [-0.999], [0.999]
+    knots = {}
+    for v, l in drivers:
+        x = rows.col(v, l)
+        ks = sorted(set(np.round(np.quantile(x, qs), 12)))
+        knots[(v, l)] = ks
+        edges = [-np.inf] + ks + [np.inf]
+        sg = signs.get(v, 0) if use else 0
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            feats.append((v, l, ("seg", lo, hi)))
+            lb.append(0.0 if sg > 0 else -np.inf)
+            ub.append(0.0 if sg < 0 else np.inf)
+    X = rows.X(feats)
+    Z = np.column_stack([rows.demean(rows.YL), rows.demean(X)]) if feats else rows.demean(rows.YL)
+    Yd = rows.demean(rows.Y)[:, 0]
+    res = lsq_linear(Z, Yd, bounds=(np.array(lb), np.array(ub)), method="bvls")
+    coef = res.x
+    rho, beta = np.array([coef[0]]), np.array([coef[1:]])
+    Xbar = rows.means(X) if feats else np.zeros((rows.nb, 0))
+    slopes = {f"{v}@{l}": [float(b) for f, b in zip(feats, coef[1:]) if f[:2] == (v, l)] for v, l in drivers}
+    return ModelSet("spline", feats, rho, beta, _alpha(rows, rho, beta, Xbar), [1.0],
+                    {"drivers": list(drivers), "knots": {f"{v}@{l}": k for (v, l), k in knots.items()},
+                     "slopes": slopes, "rho": float(coef[0])})
+
+
+# ------------------------------------------------------------------- nonlinear: linear model + boosted trees
+class HybridSet:
+    """Linear BMA equation + monotone gradient-boosted trees on its residuals.
+
+    y_t = a_i + rho y_t-1 + b'x_t  +  g(x_t, y_t-1)
+    The linear part is the BMA's weighted-average equation; g is fitted to its residuals with shallow trees,
+    constrained to be monotone in each driver in the direction of its expected sign. Trees are flat outside the
+    range of their training data, so beyond history only the linear part moves the forecast: the trees add
+    curvature inside the range seen, the linear part extrapolates.
+    """
+
+    def __init__(self, base, gbm, xfeats, info):
+        self.name, self.base, self.gbm, self.xfeats, self.info = "hybrid", base, gbm, xfeats, info
+
+    def forecast(self, bank_index, y_last, xpath, start, H):
+        b = self.base
+        K = len(b.feats)
+        Xf = np.zeros((H, K))
+        for k, f in enumerate(b.feats):
+            s = xpath[f[0]]
+            Xf[:, k] = transform(np.array([s.get(start + h - f[1], np.nan) for h in range(1, H + 1)], float),
+                                 f[2] if len(f) > 2 else None)
+        Xf = np.nan_to_num(Xf)
+        a = b.alpha[0, bank_index]
+        out = np.zeros(H)
+        prev = y_last
+        for h in range(H):
+            lin = a + b.rho[0] * prev + b.beta[0] @ Xf[h]
+            g = self.gbm.predict(np.r_[Xf[h, self.xfeats], prev][None, :])[0] if self.gbm is not None else 0.0
+            prev = lin + g
+            out[h] = prev
+        return out, out[None, :]
+
+
+def hybrid(rows, bma_set, signs, cfg, restr=None):
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    restr = restr or Restrictions(cfg)
+    hc = cfg["methods"].get("hybrid", {})
+    w = bma_set.w
+    rho = np.array([w @ bma_set.rho])
+    beta = (w @ bma_set.beta)[None, :]
+    alpha = (w @ bma_set.alpha)[None, :]
+    base = ModelSet("hybrid_linear", bma_set.feats, rho, beta, alpha, [1.0])
+    X = rows.X(base.feats)
+    fitted = alpha[0, rows.B] + rho[0] * rows.YL + (X @ beta[0] if X.shape[1] else 0.0)
+    resid = rows.Y - fitted
+    xfeats = [k for k, f in enumerate(base.feats) if len(f) == 2]        # the plain drivers
+    use = restr.uses_signs("hybrid")
+    mono = [int(signs.get(base.feats[k][0], 0)) if use else 0 for k in xfeats] + [0]
+    G = np.column_stack([X[:, xfeats], rows.YL]) if xfeats else rows.YL[:, None]
+    gbm = HistGradientBoostingRegressor(
+        max_depth=hc.get("max_depth", 2), learning_rate=hc.get("learning_rate", 0.05),
+        max_iter=hc.get("trees", 100), min_samples_leaf=max(hc.get("min_leaf", 10), rows.n // 20),
+        l2_regularization=hc.get("l2", 1.0), monotonic_cst=mono, early_stopping=False, random_state=0)
+    gbm.fit(G, resid)
+    share = float(np.var(gbm.predict(G)) / max(np.var(rows.Y), 1e-18))
+    rng = {feat_name(base.feats[k]): (float(np.min(X[:, k])), float(np.max(X[:, k]))) for k in xfeats}
+    return HybridSet(base, gbm, xfeats, {"tree_share": share, "train_range": rng, "monotone": mono[:-1]})
+
+
+# ---------------------------------------------------------------------------- direct (local projection) forecasts
+class DirectSet:
+    """One equation per horizon h = 1..H, for the cumulative change over the h quarters:
+
+        z_i,t,h = a_i,h + c_h y_i,t + sum_k b_k,h * (x_k,t+1-l + ... + x_k,t+h-l) + e
+
+    (log growth over h quarters for balances, the change for rates). The scenario enters through each driver's
+    cumulative change over the same h quarters. The coefficients are estimated jointly for all horizons with a
+    penalty on their second differences across h (smooth local projections), and each driver's coefficients are
+    bounded to its expected sign.
+    """
+
+    def __init__(self, name, drivers, c, B, A, info):
+        self.name, self.drivers, self.c, self.B, self.A, self.info = name, drivers, c, B, A, info
+
+    def forecast(self, bank_index, y_last, xpath, start, H):
+        Hm = min(H, len(self.c))
+        z = np.zeros(Hm)
+        cum = np.zeros(len(self.drivers))
+        for h in range(1, Hm + 1):
+            for k, (v, l) in enumerate(self.drivers):
+                cum[k] += np.nan_to_num(xpath[v].get(start + h - l, np.nan))
+            z[h - 1] = self.A[h - 1, bank_index] + self.c[h - 1] * y_last + self.B[h - 1] @ cum
+        if Hm < H:                       # beyond the longest horizon estimated: keep the last quarterly change
+            z = np.r_[z, z[-1] + np.arange(1, H - Hm + 1) * (z[-1] - (z[-2] if Hm > 1 else 0.0))]
+        yp = np.diff(np.r_[0.0, z])
+        return yp, yp[None, :]
+
+
+def direct(target, xhist, origin, first, drivers, signs, cfg, H, restr=None, name="direct"):
+    from scipy.optimize import lsq_linear
+
+    restr = restr or Restrictions(cfg)
+    dc = cfg["methods"].get("direct", {})
+    lam_rel = float(dc.get("smooth", 1.0))
+    use = restr.uses_signs(name)
+    K = len(drivers)
+    P = 1 + K                                         # c_h and b_k,h per horizon
+    nb = len(target.banks)
+    idx = xhist.index
+    pos = {q: k for k, q in enumerate(idx)}
+    o_pos, f_pos = pos[origin], pos.get(first, 0)
+
+    def csum(a):
+        """cumulative sums and cumulative NaN counts, so sums over (t, t+h] are differences."""
+        nan = np.isnan(a)
+        return np.r_[0.0, np.cumsum(np.where(nan, 0.0, a))], np.r_[0, np.cumsum(nan)]
+
+    XC = [csum(xhist[v].shift(l).values.astype(float)) for v, l in drivers]
+    YA, YC = [], []
+    for b in target.banks:
+        ya = target.y[b].reindex(idx).values.astype(float)
+        YA.append(ya)
+        YC.append(csum(ya))
+    meta = []
+    for h in range(1, H + 1):
+        Zh, zh, bh = [], [], []
+        t = np.arange(f_pos, o_pos - h + 1)
+        if len(t) == 0:
+            meta.append((np.zeros((0, P)), np.zeros(0), np.zeros(0, int)))
+            continue
+        cols_x = []
+        bad_x = np.zeros(len(t), bool)
+        for cs, cn in XC:
+            cols_x.append(cs[t + h + 1] - cs[t + 1])           # x at positions t+1 .. t+h
+            bad_x |= (cn[t + h + 1] - cn[t + 1]) > 0
+        for i in range(nb):
+            cs, cn = YC[i]
+            z = cs[t + h + 1] - cs[t + 1]
+            ok = ~bad_x & ((cn[t + h + 1] - cn[t + 1]) == 0) & ~np.isnan(YA[i][t])
+            if not ok.any():
+                continue
+            Zh.append(np.column_stack([YA[i][t]] + cols_x)[ok])
+            zh.append(z[ok])
+            bh.append(np.full(int(ok.sum()), i))
+        if Zh:
+            meta.append((np.vstack(Zh), np.concatenate(zh), np.concatenate(bh)))
+        else:
+            meta.append((np.zeros((0, P)), np.zeros(0), np.zeros(0, int)))
+    Hn = max([h for h, (Zh, _, _) in enumerate(meta, 1) if len(Zh) > P + nb] or [0])
+    if Hn == 0:
+        raise ValueError(f"{name}: too few observations")
+    rows_, rhs = [], []
+    means = []
+    for h in range(Hn):
+        Zh, zh, bh = meta[h]
+        cnt = np.bincount(bh, minlength=nb).astype(float)
+        c_ = np.where(cnt > 0, cnt, 1)
+        mz = np.bincount(bh, zh, minlength=nb) / c_
+        mZ = np.column_stack([np.bincount(bh, Zh[:, j], minlength=nb) / c_ for j in range(P)])
+        means.append((mz, mZ, cnt))
+        Zd, zd = Zh - mZ[bh], zh - mz[bh]
+        big = np.zeros((len(zd), Hn * P))
+        big[:, h * P:(h + 1) * P] = Zd
+        rows_.append(big)
+        rhs.append(zd)
+    Z = np.vstack(rows_)
+    zz = np.concatenate(rhs)
+    # smoothness: second differences of every coefficient across horizons, scaled to the data
+    if Hn >= 3 and lam_rel > 0:
+        scale = np.mean(np.sum(Z ** 2, axis=0)[np.sum(Z ** 2, axis=0) > 0]) if Z.size else 1.0
+        lam = lam_rel * scale
+        pen = []
+        for h in range(Hn - 2):
+            for j in range(P):
+                r = np.zeros(Hn * P)
+                r[h * P + j], r[(h + 1) * P + j], r[(h + 2) * P + j] = 1.0, -2.0, 1.0
+                pen.append(np.sqrt(lam) * r)
+        Z = np.vstack([Z, np.array(pen)])
+        zz = np.concatenate([zz, np.zeros(len(pen))])
+    lb = np.full(Hn * P, -np.inf)
+    ub = np.full(Hn * P, np.inf)
+    for h in range(Hn):
+        for k, (v, _) in enumerate(drivers):
+            sg = signs.get(v, 0) if use else 0
+            if sg > 0:
+                lb[h * P + 1 + k] = 0.0
+            elif sg < 0:
+                ub[h * P + 1 + k] = 0.0
+    coef = lsq_linear(Z, zz, bounds=(lb, ub), method="bvls").x.reshape(Hn, P)
+    c, Bm = coef[:, 0], coef[:, 1:]
+    A = np.zeros((Hn, nb))
+    for h in range(Hn):
+        mz, mZ, cnt = means[h]
+        A[h] = mz - mZ @ coef[h]
+        if (cnt == 0).any():
+            A[h, cnt == 0] = np.average(A[h, cnt > 0], weights=cnt[cnt > 0])
+    info = {"drivers": list(drivers), "horizons": Hn, "smooth": lam_rel,
+            "coef_h": {feat_name(d): [float(x) for x in Bm[:, k]] for k, d in enumerate(drivers)},
+            "persistence_h": [float(x) for x in c]}
+    return DirectSet(name, list(drivers), c, Bm, A, info)

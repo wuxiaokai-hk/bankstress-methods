@@ -88,10 +88,21 @@ intervals:
   min_calibration: 12         # errors needed before a band is computed in the honest coverage check
 
 methods:
-  run: [bma, combination, class, ar1, drift, random_walk]   # which methods to estimate (benchmarks named in
-                                                            # ranking.compare_against are always added)
+  # which methods to estimate (benchmarks named in ranking.compare_against are always added)
+  run: [bma, bma_asym, spline, hybrid, direct, direct_class, combination, class, ar1, drift, random_walk]
   bma:                        # IMF Global Solvency Stress Test: panel fixed effects, BMA, sign constraints
     max_vars: 3               # models with 0..3 macro drivers (all subsets of the screened drivers)
+  bma_asym: {}                # BMA where each driver may also enter asymmetrically (rises vs falls)
+  spline:                     # monotone piecewise-linear effects of the BMA's core drivers (inclusion >= 0.5)
+    knots: [0.333, 0.667]     # knots at these quantiles of each driver's history
+  hybrid:                     # BMA's linear equation + monotone gradient-boosted trees on its residuals
+    trees: 100
+    max_depth: 2
+    learning_rate: 0.05
+    min_leaf: 10              # at least max(min_leaf, n/20) observations per leaf
+    l2: 1.0
+  direct:                     # one equation per horizon (smooth local projection), for direct and direct_class
+    smooth: 1.0               # penalty on second differences of the coefficients across horizons; 0 = none
   combination:                # Guerrieri & Welch (2012): one regression per macro variable, lags 1..4, averaged
     lags: 4
     n_vars: 10                # the strongest 10 drivers by screening (signs not imposed, as in the paper)

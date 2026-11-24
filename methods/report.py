@@ -15,11 +15,29 @@ from .evaluate import METHOD_LABELS, METRICS  # noqa: E402
 import re  # noqa: E402
 
 INK, MUTED, GRID = "#1f2933", "#6b7785", "#e4e7eb"
-COLORS = {"bma": "#1b4f8a", "combination": "#2a9d8f", "class": "#c08a1e", "ar1": "#8e6c8a",
+COLORS = {"bma": "#1b4f8a", "bma_asym": "#4a7fc1", "spline": "#5b8c5a", "hybrid": "#7a5c99",
+          "direct": "#b5179e", "direct_class": "#e88b4a",
+          "combination": "#2a9d8f", "class": "#c08a1e", "ar1": "#8e6c8a",
           "drift": "#9aa5b1", "random_walk": "#c94f4f"}
 SCEN_COLORS = {"baseline": "#1b4f8a", "upside": "#2a9d8f", "downside": "#c08a1e", "severe": "#c94f4f"}
 
 SOURCES = [
+    ("Marcellino, Stock & Watson (2006), A comparison of direct and iterated multistep AR methods for forecasting "
+     "macroeconomic time series, Journal of Econometrics 135", "https://doi.org/10.1016/j.jeconom.2005.07.020"),
+    ("Chevillon (2007), Direct multi-step estimation and forecasting, Journal of Economic Surveys 21(4)",
+     "https://doi.org/10.1111/j.1467-6419.2007.00518.x"),
+    ("Jorda (2005), Estimation and inference of impulse responses by local projections, American Economic Review 95(1)",
+     "https://doi.org/10.1257/0002828053828518"),
+    ("Barnichon & Brownlees (2019), Impulse response estimation by smooth local projections, "
+     "Review of Economics and Statistics 101(3)", "https://doi.org/10.1162/rest_a_00778"),
+    ("Li, Plagborg-Moller & Wolf (2024), Local projections vs. VARs: lessons from thousands of DGPs, "
+     "Journal of Econometrics 244(2)", "https://arxiv.org/abs/2104.00655"),
+    ("Goulet Coulombe, Leroux, Stevanovic & Surprenant (2022), How is machine learning useful for macroeconomic "
+     "forecasting?, Journal of Applied Econometrics 37(5)", "https://doi.org/10.1002/jae.2910"),
+    ("Barbieri & Berger (2004), Optimal predictive model selection, Annals of Statistics 32(3)",
+     "https://doi.org/10.1214/009053604000000238"),
+    ("Hyndman, Ahmed, Athanasopoulos & Shang (2011), Optimal combination forecasts for hierarchical time series, "
+     "Computational Statistics & Data Analysis 55(9)", "https://doi.org/10.1016/j.csda.2011.03.006"),
     ("IMF Global Financial Stability Report, Oct 2020, Online Annex 4.1 (Global Solvency Stress Test)",
      "https://www.imf.org/-/media/Files/Publications/GFSR/2020/October/English/onlineannex41.ashx"),
     ("Guerrieri & Welch (2012), Can Macro Variables Used in Stress Testing Forecast the Performance of Banks? "
@@ -57,6 +75,32 @@ METHOD_TEXT = [
      "forecasts the most (weighted least squares reconciliation, Hyndman et al.), or one target takes the whole gap. "
      "Shown as &ldquo;method (identities)&rdquo;, next to the unadjusted forecasts. With only some of the targets in "
      "the run, or <code>identities_on: false</code>, the identity is ignored."),
+    ("asym", "Asymmetric effects (IMF BMA with rises and falls)",
+     "The same Bayesian model averaging, but each driver may also enter with separate slopes for its rises and its "
+     "falls (max(x,0) and min(x,0)), for example unemployment hurting more when it rises than it helps when it falls. "
+     "The asymmetric form costs one more parameter in the BIC, so it only takes weight when the data support it; "
+     "both slopes must have the expected sign. Stays linear in each regime, so it extrapolates into severe scenarios."),
+    ("spline", "Monotone piecewise-linear effects",
+     "The core drivers of the BMA (inclusion probability of at least 0.5, Barbieri &amp; Berger's median probability "
+     "model) enter as piecewise-linear curves with knots at the terciles of their history. The curve may bend, but "
+     "every piece must slope in the expected direction (estimated by bounded least squares), and the end pieces "
+     "continue in a straight line beyond the data, so severe scenarios still have an effect."),
+    ("hybrid", "Linear model + monotone boosted trees",
+     "The BMA's weighted-average linear equation, plus shallow gradient-boosted trees fitted to its residuals and "
+     "constrained to be monotone in each driver's expected direction. Trees are flat outside the range of their "
+     "training data, so beyond history only the linear part moves the forecast: the trees add curvature where there "
+     "is evidence, the linear part extrapolates. Nonlinearity helps most in uncertain and stressed periods "
+     "(Goulet Coulombe et al. 2022), but with about 100 quarters it must earn its place out-of-sample."),
+    ("direct", "Direct forecasts (smooth local projections)",
+     "Instead of one quarterly equation iterated forward, one equation per horizon h for the cumulative change over "
+     "h quarters, on the current change and each driver's cumulative change over the same h quarters of the scenario "
+     "(a local projection, Jorda 2005). All horizons are estimated together with a penalty on the second differences "
+     "of the coefficients across h (a P-spline with a knot at every horizon), so the paths are smooth, as in the smooth "
+     "local projections of Barnichon &amp; Brownlees (2019); coefficients are "
+     "bounded to their expected sign. Iterated forecasts are more efficient when the model is right; direct ones are "
+     "more robust when it is misspecified (Marcellino, Stock &amp; Watson 2006; Chevillon 2007), at the cost of more "
+     "variance at long horizons (Li, Plagborg-Moller &amp; Wolf 2024). <i>direct</i> uses the BMA's core drivers, "
+     "<i>direct_class</i> the CLASS-style drivers."),
     ("bench", "Benchmarks", "AR(1) with bank effects; drift (the bank's average change); random walk (no change)."),
     ("conf", "Conformal bands",
      "The 80% and 95% bands come from the out-of-sample errors of the same method at the same horizon "
@@ -255,11 +299,17 @@ def settings_html(s, macro):
     return "<p class='note'>" + " &middot; ".join(bits) + "</p>"
 
 
+def _kind(f):
+    k = f[2] if len(f) > 2 else None
+    return "" if k is None else ", rises only" if k == "+" else ", falls only" if k == "-" else ""
+
+
 def bma_table(s, macro):
     top = s["fits"]["bma"].info["top"][:5]
     rows = []
     for e in top:
-        d = "<br>".join(f"{html.escape(macro.describe(v))} (lag {l}): {b:+.4f}" for (v, l), b in zip(e["drivers"], e["beta"])) \
+        d = "<br>".join(f"{html.escape(macro.describe(f[0]))} (lag {f[1]}{_kind(f)}): {b:+.4f}"
+                        for f, b in zip(e["drivers"], e["beta"])) \
             or "<i>no macro driver (AR only)</i>"
         rows.append(f"<tr><td>{e['weight'] * 100:.1f}%</td><td>{e['rho']:.2f}</td><td>{d}</td></tr>")
     return ("<table class='small'><tr><th>BMA weight</th><th>&rho;</th><th>Drivers and coefficients</th></tr>"
@@ -302,6 +352,40 @@ def bma_block(s, macro):
     warn = f"<p class='note'><b>Warning:</b> {html.escape(i['warning'])}</p>" if i.get("warning") else ""
     return (f"<h3>IMF BMA: the five heaviest equations (all data)</h3><p class='note'>{i['n_models']} of {i['n_tried']} "
             f"equations passed the restrictions and share the weight.</p>" + warn + bma_table(s, macro))
+
+
+def extra_block(s, macro):
+    """Details of the asymmetric, spline, hybrid and direct fits on all the data."""
+    f = s["fits"]
+    out = []
+    a = f.get("bma_asym")
+    if a is not None and a.info.get("asym"):
+        items = [(d, p) for d, p in a.info["asym"].items() if a.info["pip"].get(d, 0) >= 0.1]
+        if items:
+            out.append("<b>Asymmetric effects:</b> share of the BMA weight using separate rise/fall slopes: " + "; ".join(
+                f"{html.escape(macro.describe(v))} (lag {l}) {p * 100:.0f}% of {a.info['pip'][(v, l)] * 100:.0f}%"
+                for (v, l), p in items))
+    sp = f.get("spline")
+    if sp is not None:
+        parts = []
+        for k, sl in sp.info["slopes"].items():
+            v = k.split("@")[0]
+            kn = ", ".join(f"{x:.4g}" for x in sp.info["knots"][k])
+            parts.append(f"{html.escape(macro.describe(v))}: slopes {', '.join(f'{x:+.3f}' for x in sl)} (knots {kn})")
+        out.append("<b>Monotone piecewise-linear effects</b> (slope below, between and above the knots): " +
+                   "; ".join(parts))
+    hy = f.get("hybrid")
+    if hy is not None:
+        out.append(f"<b>Hybrid:</b> the trees explain {hy.info['tree_share'] * 100:.1f}% of the variance of the target "
+                   f"on top of the linear equation; outside the range of history they add nothing.")
+    for m in ("direct", "direct_class"):
+        d = f.get(m)
+        if d is not None:
+            co = "; ".join(f"{html.escape(macro.describe(k.split('@')[0]))}: {v[0]:+.3f} at 1q, "
+                           f"{v[min(3, len(v) - 1)]:+.3f} at 4q, {v[-1]:+.3f} at {len(v)}q"
+                           for k, v in d.info["coef_h"].items())
+            out.append(f"<b>{_label(m)}:</b> effect of each driver's cumulative change: {co or 'no drivers'}.")
+    return "".join(f"<p class='note'>{x}</p>" for x in out)
 
 
 def class_line(s, macro):
@@ -401,6 +485,7 @@ Shaded: 80% and 95% conformal bands for baseline and severe.</figcaption></figur
 </div>
 {bma_block(s, macro)}
 {class_line(s, macro)}
+{extra_block(s, macro)}
 <h3>Scenario range check</h3>
 {range_html(s, macro)}
 </section>""")

@@ -6,9 +6,9 @@ out-of-sample against simple benchmarks. It is independent of the `macroforecast
 it reads the same kind of files (macro scenarios, a metadata file with expected signs, bank data).
 
 ```
-pip install -r requirements.txt
-python run.py            # full test, about 2 minutes on the example data
-python run.py --quick    # origins every 4th quarter, about 30 seconds
+pip install -r requirements.txt      # numpy, pandas, scipy, scikit-learn, matplotlib, pyyaml
+python run.py            # full test, about 6 minutes on the example data
+python run.py --quick    # origins every 4th quarter, about 1-2 minutes
 python run.py --targets loans_panel nii
 python run.py --mode separate --banks "Bank A" "Bank C"     # each bank on its own, two banks
 python run.py --metric cvar                                 # rank by the average of the worst 10% of errors
@@ -24,6 +24,10 @@ Open `outputs/report.html`.
 | **Forecast combination** | Guerrieri & Welch (2012), Fed FEDS 2012-49 | One equation per macro variable (own lag + lags 1–4 of the variable), equal-weighted. |
 | **CLASS-style** | Hirtle, Kovner, Vickery & Bhanot (2016), NY Fed CLASS model | One small fixed equation per target with drivers chosen on economic grounds (`class_drivers`), the same at every origin. A transparent challenger. |
 | **Rate × balance** | Federal Reserve supervisory PPNR models | For income, each method forecasts the parts (rates and balances); the income is rebuilt from them instead of being forecast in dollars. |
+| **Asymmetric BMA** (`bma_asym`) | IMF GST + asymmetric effects | The same BMA, where each driver may also enter with separate slopes for its rises and falls; the extra parameter has to pay for itself in the BIC. Both slopes keep the expected sign. |
+| **Monotone piecewise-linear** (`spline`) | Shape-constrained regression; Barbieri & Berger (2004) for the driver set | The BMA's core drivers (inclusion ≥ 0.5, the median probability model) enter as piecewise-linear curves with knots at the terciles; every piece keeps the expected sign; the end pieces extrapolate linearly. |
+| **Hybrid** (`hybrid`) | Goulet Coulombe et al. (2022) on nonlinearity in macro forecasting | The BMA's average linear equation + shallow gradient-boosted trees on its residuals, monotone in each driver's expected direction. Trees are flat beyond history, so only the linear part extrapolates into severe scenarios. |
+| **Direct** (`direct`, `direct_class`) | Marcellino, Stock & Watson (2006); Chevillon (2007); Jordà (2005); Barnichon & Brownlees (2019); Li, Plagborg-Møller & Wolf (2024) | One equation per horizon for the cumulative change over h quarters, on the current change and each driver's cumulative change over the same h quarters of the scenario (a local projection). All horizons estimated together with a smoothness penalty across h; coefficients bounded to the expected sign. `direct` uses the BMA's core drivers, `direct_class` the CLASS-style drivers. |
 | **Benchmarks** | | AR(1) with bank effects, drift (average growth), random walk (no change). |
 | **Conformal bands** | | 80% / 95% bands from each method's own out-of-sample errors at each horizon, with a real-time coverage check. |
 
@@ -109,6 +113,22 @@ Every metric is computed at each horizon over all origins and banks and then ave
 naturally larger long-horizon errors don't dominate (except `worst`, the largest error at any horizon). The
 leaderboard always shows all of them, whichever is used for the ranking.
 
+## Direct versus iterated, and nonlinear models: what the literature says
+
+* **Direct vs iterated.** Iterated forecasts are more efficient when the model is correctly specified; direct
+  forecasts are more robust when it is misspecified (Marcellino, Stock & Watson 2006). Across 170 US macro series the
+  iterated forecasts usually won, increasingly so at longer horizons. Direct gains need misspecification together
+  with non-stationarity or breaks (Chevillon 2007). Local projections have lower bias but much higher variance at
+  intermediate and long horizons than iterated models, so shrinkage or smoothing is recommended (Li, Plagborg-Møller
+  & Wolf 2024; Barnichon & Brownlees 2019), which is why the direct methods here are smoothed across horizons.
+  With about 100 quarters, a 12-quarter regression has only ~8 non-overlapping windows: expect noisy coefficients.
+* **Nonlinearity.** Nonlinearity is the main source of machine-learning gains in macro forecasting, and the gains
+  are concentrated in uncertain and stressed periods (Goulet Coulombe et al. 2022). But tree models cannot
+  extrapolate: beyond the historical range they are flat, which would understate a severe scenario. The nonlinear
+  methods here therefore keep a linear part that extrapolates (asymmetric BMA, monotone spline end pieces, the
+  hybrid's linear equation), and the report's range check lists scenario values outside history.
+* All of them are challengers: they enter the same rolling-origin test and are ranked with the same metrics.
+
 ## How the test works
 
 * **Rolling origin.** From `oos.start` on, at every origin each method is re-estimated (the BMA and the combination
@@ -145,17 +165,20 @@ leaderboard always shows all of them, whichever is used for the ranking.
 
 ## What the example run shows
 
-On the simulated example data (the same data as the main project):
+On the simulated example data (the same data as the main project), with every method in the test:
 
-* The **IMF BMA is the most accurate method for 6 of the 8 balance and rate targets**, and second for the other 2
-  (mortgage and deposit balances), where the fixed CLASS-style equation wins. For net interest income the best method
-  is the BMA applied rate × balance. It recovers the drivers the loan data were simulated with
-  (house prices and disposable income, a quarter later) with inclusion probabilities close to 1.
-* The **Fed's rate × balance approach cuts the error of net interest income by about a third** for the BMA
-  (17.7% vs 27.7% of the level), because NII is a small difference of two large products and is far noisier
-  than its parts.
-* Every macro model beats the random walk and AR(1) clearly for balances; for rates, AR(1) and drift are worse than
-  the random walk, while the BMA beats it by 50–60%.
+* **Direct forecasts win both rate targets clearly** (mortgage rate 0.24 vs 0.29 pp for the BMA; deposit rate 0.19
+  vs 0.26 pp), and by the tail measures too. This is the case the literature predicts: the simulated rates are
+  pulled back towards a bond yield's level, which the quarterly equations in changes do not model
+  (misspecification), and the direct regressions absorb it. With rates × balances, direct also gives the best net
+  interest income (16.9% vs 17.7%).
+* **Asymmetric effects help a little where they exist**: best for one-bank loans (0.80% vs 0.84%) and commercial
+  loans (1.39% vs 1.42%), and best on the worst 10% of errors for the five-bank loans.
+* **The hybrid with boosted trees** is best only for one-bank deposits (1.75% vs 1.82%); elsewhere it is close to the
+  BMA. With about 100 quarters there is little room for extra flexibility to pay off.
+* **The fixed CLASS-style equation** remains best for mortgages, deposits and total loans (five banks).
+* No single method wins everywhere, which is the point of running them side by side and letting the out-of-sample
+  test, with the metric you choose, decide per target.
 * **Bands are too narrow in real time** (roughly 50–80% coverage for a nominal 80%), because the early calibration
   years were calmer than 2020 and 2022. The scenario bands use every error, shocks included, and are wider.
 
@@ -167,7 +190,8 @@ These are results on simulated data; on real data run the same comparison before
 run.py                 the run: fit, test, scenarios, files, report
 config.yaml            data, targets, method settings
 methods/data.py        macro scenarios, sign files, targets (organic change)
-methods/models.py      the equation form, screening, BMA, combination, CLASS-style, benchmarks
+methods/models.py      the equation form, screening, BMA (+ asymmetric), combination, CLASS-style, monotone
+                       piecewise-linear, hybrid linear + boosted trees, direct (smooth local projections), benchmarks
 methods/evaluate.py    rolling-origin test, rate x balance, conformal bands, coverage, scenarios, range check
 methods/identities.py  accounting identities between targets (reconcile or residual)
 methods/report.py      the HTML report

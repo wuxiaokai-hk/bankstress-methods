@@ -14,6 +14,11 @@ METHOD_LABELS = {
     "bma": "IMF: Bayesian model averaging, sign-constrained",
     "combination": "Guerrieri-Welch: forecast combination",
     "class": "NY Fed CLASS-style fixed equation",
+    "bma_asym": "IMF BMA with asymmetric effects",
+    "spline": "Monotone piecewise-linear effects",
+    "hybrid": "Linear BMA + monotone boosted trees",
+    "direct": "Direct (smooth local projection), BMA drivers",
+    "direct_class": "Direct (smooth local projection), CLASS drivers",
     "ar1": "AR(1) benchmark",
     "drift": "Drift (average growth) benchmark",
     "random_walk": "Random walk (no change) benchmark",
@@ -34,7 +39,9 @@ def first_row(macro, cfg):
     return x.index[0] + lags + 1          # x starts with a NaN (the first change), then needs `lags` lags
 
 
-ALL_METHODS = ["bma", "combination", "class", "ar1", "drift", "random_walk"]
+ALL_METHODS = ["bma", "bma_asym", "spline", "hybrid", "direct", "direct_class", "combination", "class",
+               "ar1", "drift", "random_walk"]
+NEEDS_BMA = {"spline", "hybrid", "direct"}
 
 
 def methods_to_run(cfg):
@@ -56,17 +63,35 @@ def fit_all(target, macro, signs, themes, origin, cfg, first):
     restr = M.Restrictions(cfg)
     run = methods_to_run(cfg)
     out = {}
-    if "bma" in run:
+    H = int(cfg["horizon"])
+    bma_set = None
+    if "bma" in run or "bma_asym" in run or NEEDS_BMA & set(run):
         screened = M.screen(rows, signs, themes, cfg, signed=restr.uses_signs("bma"), restr=restr)
-        out["bma"] = M.bma(rows, screened, signs, cfg, restr)
-        out["bma"].info["screened"] = screened
+        bma_set = M.bma(rows, screened, signs, cfg, restr)
+        bma_set.info["screened"] = screened
+        if "bma" in run:
+            out["bma"] = bma_set
+        if "bma_asym" in run:
+            out["bma_asym"] = M.bma(rows, screened, signs, cfg, restr, asym=True, name="bma_asym")
+            out["bma_asym"].info["screened"] = screened
     if "combination" in run:
         cs = M.screen(rows, signs, themes, cfg, signed=restr.uses_signs("combination"),
                       n_keep=cfg["methods"]["combination"].get("n_vars", 10), restr=restr)
         out["combination"] = M.combination(rows, cs, cfg, signs, restr)
-    if "class" in run and cfg["methods"].get("class", {}).get("enabled", True) and target.cfg.get("class_drivers"):
-        out["class"] = M.fixed(rows, parse_drivers(target.cfg["class_drivers"]), "class", signs,
-                               check_signs=restr.uses_signs("class"))
+    class_drivers = parse_drivers(target.cfg.get("class_drivers"))
+    if "class" in run and cfg["methods"].get("class", {}).get("enabled", True) and class_drivers:
+        out["class"] = M.fixed(rows, class_drivers, "class", signs, check_signs=restr.uses_signs("class"))
+    if bma_set is not None:
+        core = M.median_model(bma_set)
+        if "spline" in run:
+            out["spline"] = M.spline(rows, core, signs, cfg, restr)
+        if "hybrid" in run:
+            out["hybrid"] = M.hybrid(rows, bma_set, signs, cfg, restr)
+        if "direct" in run:
+            out["direct"] = M.direct(target, macro.history(), origin, first, core, signs, cfg, H, restr, "direct")
+    if "direct_class" in run and class_drivers:
+        out["direct_class"] = M.direct(target, macro.history(), origin, first, class_drivers, signs, cfg, H, restr,
+                                       "direct_class")
     for b in ("random_walk", "drift", "ar1"):
         if b in run:
             out[b] = getattr(M, b)(rows)

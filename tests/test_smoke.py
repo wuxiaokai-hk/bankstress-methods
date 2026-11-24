@@ -100,3 +100,26 @@ def test_identities(tmp_path):
     s = run.main(["--config", str(p), "--quick", "--no-report", "--targets", "mortgage_balance", "commercial_balance"])
     assert not any("(identities)" in m for m in s["mortgage_balance"]["lb"].index)
     assert s["mortgage_balance"]["identities"][0]["active"] is False
+
+
+def test_new_methods(tmp_path):
+    """Asymmetric BMA, monotone spline, hybrid and direct forecasts run and keep the expected signs."""
+    import yaml
+    cfg = _cfg(tmp_path)
+    cfg["methods"]["run"] = ["bma", "bma_asym", "spline", "hybrid", "direct", "direct_class"]
+    p = tmp_path / "c.yaml"
+    p.write_text(yaml.safe_dump(cfg))
+    s = run.main(["--config", str(p), "--quick", "--no-report", "--targets", "loans_panel"])
+    u = s["loans_panel"]
+    assert {"bma_asym", "spline", "hybrid", "direct", "direct_class"} <= set(u["lb"].index)
+    assert np.isfinite(u["lb"]["score"]).all()
+    f, signs = u["fits"], u["signs"]
+    for k, sl in f["spline"].info["slopes"].items():          # every piece keeps the expected sign
+        sg = signs.get(k.split("@")[0], 0)
+        assert all(x * sg >= -1e-12 for x in sl)
+    for k, co in f["direct"].info["coef_h"].items():
+        sg = signs.get(k.split("@")[0], 0)
+        assert all(x * sg >= -1e-12 for x in co)
+    assert len(f["direct"].info["persistence_h"]) == 12
+    for m in ("spline", "hybrid", "direct"):
+        assert all(np.isfinite(v).all() for v in u["scen"][m]["severe"].values())
