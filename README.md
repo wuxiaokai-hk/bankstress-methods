@@ -14,7 +14,8 @@ python run.py --mode separate --banks "Bank A" "Bank C"     # each bank on its o
 python run.py --metric cvar                                 # rank by the average of the worst 10% of errors
 ```
 
-Open `outputs/report.html`.
+Open `outputs/report.html`. A report of the full run on the example data is in
+[`docs/report.html`](docs/report.html) (download it and open it in a browser; GitHub shows HTML as source).
 
 ## The methods
 
